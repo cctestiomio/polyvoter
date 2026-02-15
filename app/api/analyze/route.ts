@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import type { Candle, AnalyzeResponse } from "@/lib/types";
-import { computeIndicators } from "@/lib/analyze";
+import { computeIndicators } from "../../../lib/analyze";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
