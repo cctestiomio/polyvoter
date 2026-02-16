@@ -22,12 +22,14 @@ type Props = {
 export default function RtdsBtcPriceChart({ theme, onPrice }: Props) {
   const elRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
-  
+
   // Main series (Right scale)
   const seriesRef = useRef<ISeriesApi<"Line"> | null>(null);
-  
+
   // Dummy series for Left-side "Price To Beat" label
   const leftSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+
+  const esRef = useRef<EventSource | null>(null);
 
   const startedRef = useRef(false);
   const hasFittedRef = useRef(false);
@@ -47,7 +49,7 @@ export default function RtdsBtcPriceChart({ theme, onPrice }: Props) {
     };
   }, [theme]);
 
-  // 1. Initialize Chart
+  // 1) Initialize chart
   useEffect(() => {
     if (!elRef.current) return;
 
@@ -62,12 +64,10 @@ export default function RtdsBtcPriceChart({ theme, onPrice }: Props) {
         vertLines: { color: colors.grid },
         horzLines: { color: colors.grid },
       },
-      // Right scale for actual price data
-      rightPriceScale: { 
+      rightPriceScale: {
         borderVisible: false,
         visible: true,
       },
-      // Left scale ENABLED for the "Price To Beat" label
       leftPriceScale: {
         visible: true,
         borderVisible: false,
@@ -83,22 +83,26 @@ export default function RtdsBtcPriceChart({ theme, onPrice }: Props) {
 
     chartRef.current = chart;
 
-    // Main Series (Right Scale)
+    // Main Series (Right)
     seriesRef.current = chart.addLineSeries({
       color: colors.line,
       lineWidth: 2,
       priceLineVisible: true,
       lastValueVisible: true,
-      priceScaleId: "right", // Attach to right
+      priceScaleId: "right",
+      crosshairMarkerVisible: true,
     });
 
-    // Dummy Series (Left Scale) - just to hold the price line
+    // Dummy Series (Left) — DO NOT use lineWidth: 0 (invalid type in LWC typings).
+    // Hide it via lineVisible: false.
     leftSeriesRef.current = chart.addLineSeries({
-      color: "transparent", // Invisible series
-      lineWidth: 0,
-      priceScaleId: "left", // Attach to left
+      color: "transparent",
+      lineVisible: false,
+      lineWidth: 1,
+      priceScaleId: "left",
       lastValueVisible: false,
       priceLineVisible: false,
+      crosshairMarkerVisible: false,
     });
 
     const ro = new ResizeObserver(() => {
@@ -114,12 +118,13 @@ export default function RtdsBtcPriceChart({ theme, onPrice }: Props) {
       chartRef.current = null;
       seriesRef.current = null;
       leftSeriesRef.current = null;
+
       hasFittedRef.current = false;
       priceToBeatRef.current = null;
     };
   }, [colors]);
 
-  // 2. Stream Logic
+  // 2) Stream logic
   useEffect(() => {
     if (startedRef.current) return;
     startedRef.current = true;
@@ -127,17 +132,18 @@ export default function RtdsBtcPriceChart({ theme, onPrice }: Props) {
     setStatus("Connecting…");
 
     const es = new EventSource(`/api/stream-btc?t=${Date.now()}`);
+    esRef.current = es;
 
     es.onmessage = (ev) => {
       try {
-        const msg = JSON.parse(ev.data);
+        const msg: any = JSON.parse(ev.data);
 
-        if (msg.type === "status") {
+        if (msg?.type === "status") {
           setStatus(String(msg.status));
           return;
         }
-        if (msg.type === "ping") return;
-        if (msg.type !== "tick") return;
+        if (msg?.type === "ping") return;
+        if (msg?.type !== "tick") return;
 
         const price = Number(msg.value ?? msg.price);
         const tsMs = Number(msg.tsMs);
@@ -145,44 +151,41 @@ export default function RtdsBtcPriceChart({ theme, onPrice }: Props) {
         if (!Number.isFinite(tsMs) || !Number.isFinite(price)) return;
 
         const t = Math.floor(tsMs / 1000) as UTCTimestamp;
-        const pt = { time: t, value: price } as LineData;
+        const pt: LineData = { time: t, value: price };
 
-        // Update Main Series
+        // Update main series (right)
         seriesRef.current?.update(pt);
-        
-        // Update Left Series (Invisible) so scaling stays synced roughly
-        // (Optional, but helps keep the left axis range reasonable)
+
+        // Update dummy series (left) to keep left scale “alive”
         leftSeriesRef.current?.update(pt);
 
         setLastPrice(price);
         setLastIso(new Date(tsMs).toISOString());
         onPrice?.(price, tsMs);
 
-        // --- Add "Price To Beat" on LEFT side (once) ---
+        // Add “Price To Beat” line once on LEFT axis
         if (priceToBeatRef.current === null && leftSeriesRef.current) {
           priceToBeatRef.current = price;
 
           leftSeriesRef.current.createPriceLine({
-            price: price,
-            color: colors.text, // Matches theme text color
+            price,
+            color: colors.text,
             lineWidth: 1,
             lineStyle: LineStyle.Dashed,
-            axisLabelVisible: true, // Shows label on LEFT axis
+            axisLabelVisible: true,
             title: "Price To Beat",
           });
         }
-        // -----------------------------------------------
 
-        // Initial Fit (5 min window)
+        // Initial fit (roughly last ~300 points), then keep pinned to latest
         if (!hasFittedRef.current && chartRef.current) {
           hasFittedRef.current = true;
-          chartRef.current.timeScale().setVisibleLogicalRange({
-            from: -300,
-            to: 10,
-          } as LogicalRange);
+          chartRef.current.timeScale().setVisibleLogicalRange({ from: -300, to: 10 } as LogicalRange);
         }
 
-      } catch (e) {
+        // Keep latest data visible (prevents “stuck on the left” after refresh)
+        chartRef.current?.timeScale().scrollToRealTime();
+      } catch {
         // ignore
       }
     };
@@ -194,6 +197,7 @@ export default function RtdsBtcPriceChart({ theme, onPrice }: Props) {
 
     return () => {
       es.close();
+      esRef.current = null;
       startedRef.current = false;
     };
   }, [onPrice, colors.text]);
