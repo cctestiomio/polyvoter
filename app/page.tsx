@@ -455,7 +455,7 @@ export default function Page() {
     const rate = total > 0 ? (matches / total) * 100 : 0;
     return { total, matches, rate };
   }, [marketEvents]);
-  
+
   const hitMissStats = useMemo(() => {
     // only rows where outcome is resolved AND we have a hitSide (Yes/No)
     const scored = marketEvents.filter(
@@ -468,14 +468,7 @@ export default function Page() {
     return { hits, misses, total: scored.length };
   }, [marketEvents]);
 
-  // No hook needed here; just compute it from the memoized stats:
   const hitRatePct = hitMissStats.total > 0 ? (hitMissStats.hits / hitMissStats.total) * 100 : 0;
-
-  const hits = scored.filter((e) => e.hitSide === e.outcome).length;
-  const misses = scored.filter((e) => e.hitSide !== e.outcome).length;
-
-  return { hits, misses, total: scored.length };
-  }, [marketEvents]);
 
   const btcChartKey = `btc-${tsSec}`; // refresh every slug
 

@@ -43,7 +43,7 @@ function toPts(hist: HistPoint[]): Pt[] {
     .map((p) => ({ time: Number(p.t) as UTCTimestamp, value: Number(p.p) }))
     .filter((x) => Number.isFinite(x.time) && Number.isFinite(x.value))
     .sort((a, b) => a.time - b.time)
-    .filter((v, i, a) => i === 0 || v.time !== a[i - 1].time); // Dedupe
+    .filter((v, i, a) => i === 0 || v.time !== a[i - 1].time);
 }
 
 export default function PolyLiveChart({
@@ -63,6 +63,11 @@ export default function PolyLiveChart({
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isUnmountedRef = useRef(false);
 
+  // Tracks whether we should “follow” realtime (stay pinned to the right).
+  // If user scrolls left, this turns false until they return near the right edge.
+  const autoFollowRef = useRef(true);
+
+  // Track if we have set the initial 5m range
   const hasFittedRef = useRef(false);
 
   const [status, setStatus] = useState("Idle");
@@ -81,7 +86,25 @@ export default function PolyLiveChart({
     };
   }, [theme]);
 
-  // 1) Initialize chart
+  const closeStream = () => {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+  };
+
+  const followRightEdge = () => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    // Always animated; returns chart to “realtime” position.
+    chart.timeScale().scrollToRealTime();
+  };
+
+  // 1) Initialize chart + subscribe to user scrolling
   useEffect(() => {
     if (!elRef.current) return;
 
@@ -118,16 +141,25 @@ export default function PolyLiveChart({
       crosshairMarkerVisible: true,
     });
 
+    // Detect whether user has scrolled away from realtime.
+    const ts = chart.timeScale();
+    const onRangeChange = () => {
+      // scrollPosition() is distance from right edge to latest bar (in bars).
+      const pos = ts.scrollPosition();
+      autoFollowRef.current = pos <= 2; // “near the right edge”
+    };
+    ts.subscribeVisibleLogicalRangeChange(onRangeChange);
+
     const ro = new ResizeObserver(() => {
       if (elRef.current && chartRef.current) {
         chartRef.current.applyOptions({ width: elRef.current.clientWidth });
       }
     });
-
     ro.observe(elRef.current);
 
     return () => {
       ro.disconnect();
+      ts.unsubscribeVisibleLogicalRangeChange(onRangeChange);
       chart.remove();
       chartRef.current = null;
       yesSeriesRef.current = null;
@@ -136,23 +168,29 @@ export default function PolyLiveChart({
     };
   }, [colors]);
 
-  const closeStream = () => {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
-    }
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-  };
+  // 1b) When tab becomes visible again, re-follow realtime
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        autoFollowRef.current = true;
+        followRightEdge();
+      }
+    };
+
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+    };
+  }, []);
 
   // 2) Backfill + stream
   const connect = async () => {
     if (isUnmountedRef.current || !yesTokenId || !noTokenId) return;
 
     closeStream();
-
     setStatus("Loading history...");
 
     try {
@@ -186,11 +224,14 @@ export default function PolyLiveChart({
         }
       }
 
-      // Your exact initial 5m view logic
+      // Your initial 5m-ish view logic (only once)
       if (!hasFittedRef.current && chartRef.current) {
         hasFittedRef.current = true;
         chartRef.current.timeScale().setVisibleLogicalRange({ from: -300, to: 10 } as LogicalRange);
       }
+
+      // After backfill, follow realtime (unless user purposely scrolled away earlier)
+      if (autoFollowRef.current) followRightEdge();
     } catch {
       // still attempt stream
     }
@@ -206,7 +247,10 @@ export default function PolyLiveChart({
     const es = new EventSource(url);
     eventSourceRef.current = es;
 
-    es.onopen = () => setStatus("Streaming");
+    es.onopen = () => {
+      setStatus("Streaming");
+      if (autoFollowRef.current) followRightEdge();
+    };
 
     es.onmessage = (ev) => {
       try {
@@ -245,10 +289,8 @@ export default function PolyLiveChart({
         if (updated) {
           setLastIso(new Date(tsMs).toISOString());
 
-          if (!hasFittedRef.current && chartRef.current) {
-            hasFittedRef.current = true;
-            chartRef.current.timeScale().setVisibleLogicalRange({ from: -300, to: 10 } as LogicalRange);
-          }
+          // This is the key: if we’re in “follow” mode, always push view to the right.
+          if (autoFollowRef.current) followRightEdge();
         }
       } catch {
         // ignore
@@ -264,10 +306,11 @@ export default function PolyLiveChart({
     };
   };
 
-  // 3) Trigger on token change (and window change so drilling refreshes)
+  // 3) Trigger on token change (and window change)
   useEffect(() => {
     isUnmountedRef.current = false;
     hasFittedRef.current = false;
+    autoFollowRef.current = true;
 
     if (yesTokenId && noTokenId) {
       yesSeriesRef.current?.setData([]);
@@ -281,7 +324,6 @@ export default function PolyLiveChart({
       isUnmountedRef.current = true;
       closeStream();
     };
-    // windowStartTsSec included so drill changes re-run backfill and view
   }, [yesTokenId, noTokenId, windowStartTsSec]);
 
   return (
@@ -302,8 +344,22 @@ export default function PolyLiveChart({
         <div ref={elRef} />
       </div>
 
-      <div className="px-4 py-3 text-xs bg-white text-zinc-600 dark:bg-zinc-950 dark:text-zinc-400">
-        Last tick: <span className="font-mono">{lastIso}</span>
+      <div className="px-4 py-3 text-xs bg-white text-zinc-600 dark:bg-zinc-950 dark:text-zinc-400 flex items-center justify-between">
+        <span>
+          Last tick: <span className="font-mono">{lastIso}</span>
+        </span>
+
+        <button
+          type="button"
+          onClick={() => {
+            autoFollowRef.current = true;
+            followRightEdge();
+          }}
+          className="rounded-md px-2 py-1 ring-1 ring-zinc-200 text-zinc-700 hover:bg-zinc-50
+                     dark:ring-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-900"
+        >
+          Go realtime
+        </button>
       </div>
     </div>
   );
