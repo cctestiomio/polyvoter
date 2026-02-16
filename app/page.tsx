@@ -157,26 +157,31 @@ function parseEventsFromHit80(hit80Json: any): MarketEvent[] {
   return out;
 }
 
-function parseTaSummary(taJson: any): { accuracyPct: number; totalSignals: number } {
-  const accuracyPct =
-    (Number.isFinite(taJson?.accuracyPct) && Number(taJson.accuracyPct)) ||
-    (Number.isFinite(taJson?.pct) && Number(taJson.pct)) ||
-    (Number.isFinite(taJson?.accuracy) && Number(taJson.accuracy)) ||
-    0;
+/**
+ * Compute TA correctness directly from the same per-slug rows shown in TA Predictions.
+ * - Only score rows with resolved outcome (Yes/No) and scorable prediction (Yes/No).
+ * - Apply window=30 on the most recent scored rows.
+ */
+function computeTaCorrectnessFromRows(
+  rows: TaPredRow[],
+  window: number
+): { accuracyPct: number; totalSignals: number; correct: number } {
+  const scorable = rows.filter(
+    (r) => (r.outcome === "Yes" || r.outcome === "No") && (r.prediction === "Yes" || r.prediction === "No")
+  );
 
-  const totalSignals =
-    (Number.isFinite(taJson?.totalSignals) && Number(taJson.totalSignals)) ||
-    (Number.isFinite(taJson?.signals) && Number(taJson.signals)) ||
-    (Number.isFinite(taJson?.total) && Number(taJson.total)) ||
-    0;
+  const windowRows = scorable.slice(0, Math.max(0, window | 0));
+  const correct = windowRows.filter((r) => r.prediction === r.outcome).length;
 
-  return { accuracyPct, totalSignals };
+  const totalSignals = windowRows.length;
+  const accuracyPct = totalSignals > 0 ? (correct / totalSignals) * 100 : 0;
+
+  return { accuracyPct, totalSignals, correct };
 }
 
 /**
- * KEY FIX:
- * - Parse TA rows from taJson
- * - Fill `outcome` using outcomesBySlug from the Event Log (poly-hit80), so it doesn't stay Pending.
+ * Parse TA rows from taJson and fill `outcome` using outcomesBySlug from the Event Log.
+ * More robust extraction of prediction shapes.
  */
 function parseTaRowsToTable(taJson: any, outcomesBySlug: Map<string, "Yes" | "No">): TaPredRow[] {
   const rows = Array.isArray(taJson?.rows) ? taJson.rows : Array.isArray(taJson?.perSlug) ? taJson.perSlug : [];
@@ -196,12 +201,38 @@ function parseTaRowsToTable(taJson: any, outcomesBySlug: Map<string, "Yes" | "No
     if (!Number.isFinite(startTsSec)) continue;
     const endTsSec = (Number.isFinite(Number(r.endTsSec)) && Number(r.endTsSec)) || startTsSec + 300;
 
-    const prediction =
-      coercePredictionToYesNoNeutral(r.prediction) ??
-      coercePredictionToYesNoNeutral(r.predictedSide) ??
-      coercePredictionToYesNoNeutral(r.signal) ??
-      coercePredictionToYesNoNeutral(r.verdict) ??
+    const rawPred =
+      r.prediction ??
+      r.predictedSide ??
+      r.signal ??
+      r.verdict ??
+      r.side ??
+      r?.pred?.side ??
+      r?.pred?.verdict ??
+      r?.prediction?.side ??
+      r?.prediction?.verdict ??
       null;
+
+    let prediction =
+      coercePredictionToYesNoNeutral(rawPred) ??
+      coercePredictionToYesNoNeutral(r?.prediction?.value) ??
+      null;
+
+    // If prediction is a probability (e.g. probYes), map it.
+    if (prediction == null) {
+      const pYes =
+        (Number.isFinite(Number((r as any).probYes)) && Number((r as any).probYes)) ||
+        (Number.isFinite(Number((r as any).pYes)) && Number((r as any).pYes)) ||
+        (Number.isFinite(Number((r as any).yesProb)) && Number((r as any).yesProb)) ||
+        (Number.isFinite(Number((r as any).probabilityYes)) && Number((r as any).probabilityYes)) ||
+        null;
+
+      if (pYes != null) {
+        if (pYes > 0.5) prediction = "Yes";
+        else if (pYes < 0.5) prediction = "No";
+        else prediction = "Neutral";
+      }
+    }
 
     const outcomeFromEventLog = outcomesBySlug.get(slug) ?? null;
 
@@ -282,8 +313,10 @@ export default function Page() {
       setResolveStatus("Resolving...");
       try {
         const res = await fetch(
-          `/api/poly-resolve?marketBase=${encodeURIComponent(base)}&desiredStartTsSec=${encodeURIComponent(String(tsSec))}&lookbackIntervals=120`,
-          { cache: "no-store" } // ensure fresh [web:90]
+          `/api/poly-resolve?marketBase=${encodeURIComponent(base)}&desiredStartTsSec=${encodeURIComponent(
+            String(tsSec)
+          )}&lookbackIntervals=120`,
+          { cache: "no-store" }
         );
         const json = await res.json().catch(() => null);
         if (!res.ok) throw new Error(errToText(json?.error ?? json));
@@ -325,7 +358,7 @@ export default function Page() {
   const handleYesMid = useCallback((mid: number) => setYesMid(mid), []);
   const handleNoMid = useCallback((mid: number) => setNoMid(mid), []);
 
-  // Fetch hit80 + ta accuracy
+  // Fetch hit80 + ta rows, then compute TA correctness from the parsed rows
   const eventFetchIdRef = useRef(0);
 
   useEffect(() => {
@@ -351,13 +384,13 @@ export default function Page() {
             `/api/poly-hit80?marketBase=${encodeURIComponent(base)}&anchorStartTsSec=${encodeURIComponent(
               String(anchor)
             )}&count=${encodeURIComponent(String(historySlugs))}&threshold=0.8&fidelity=1`,
-            { cache: "no-store" } // ensure fresh [web:90]
+            { cache: "no-store" }
           ),
           fetch(
             `/api/poly-ta-accuracy?marketBase=${encodeURIComponent(base)}&anchorStartTsSec=${encodeURIComponent(
               String(anchor)
             )}&count=${encodeURIComponent(String(historySlugs))}&window=30&fidelity=1`,
-            { cache: "no-store" } // ensure fresh [web:90]
+            { cache: "no-store" }
           ),
         ]);
 
@@ -375,18 +408,24 @@ export default function Page() {
           if (e.outcome === "Yes" || e.outcome === "No") outcomesBySlug.set(e.slug, e.outcome);
         }
 
-        const taParsed = parseTaSummary(taJson);
         const taRows = parseTaRowsToTable(taJson, outcomesBySlug);
+
+        // Compute correctness from TA rows (not from taJson summary fields)
+        const TA_WINDOW = 30;
+        const taComputed = computeTaCorrectnessFromRows(taRows, TA_WINDOW);
 
         if (!alive) return;
         if (fetchId !== eventFetchIdRef.current) return;
 
         setMarketEvents(events);
-        setTaAccuracyPct(taParsed.accuracyPct);
-        setTaTotalSignals(taParsed.totalSignals);
         setTaPredRows(taRows);
 
-        setEventLogStatus(events.length ? "Idle" : `No events found (response keys: ${Object.keys(hit80Json ?? {}).join(", ")})`);
+        setTaAccuracyPct(taComputed.accuracyPct);
+        setTaTotalSignals(taComputed.totalSignals);
+
+        setEventLogStatus(
+          events.length ? "Idle" : `No events found (response keys: ${Object.keys(hit80Json ?? {}).join(", ")})`
+        );
       } catch (e: any) {
         if (!alive) return;
         setEventLogErr(errToText(e));
@@ -553,7 +592,9 @@ export default function Page() {
             Split tables side-by-side
           </label>
 
-          <span className={`inline-flex items-center rounded-full px-3 py-1 text-sm ${pillClasses(verdict)}`}>Verdict: {verdict}</span>
+          <span className={`inline-flex items-center rounded-full px-3 py-1 text-sm ${pillClasses(verdict)}`}>
+            Verdict: {verdict}
+          </span>
 
           <span className="text-xs text-zinc-600 dark:text-zinc-400">
             Votes: <span className="font-mono">{upVotes}U / {downVotes}D</span>
@@ -574,7 +615,12 @@ export default function Page() {
 
       <div className="grid gap-6 lg:grid-cols-2 h-[400px]">
         <div key={btcChartKey} className="h-full w-full">
-          <RtdsBtcPriceChart theme={effectiveTheme} source={"binance"} targetPrice={targetPrice} onPrice={handleBtcOnPrice} />
+          <RtdsBtcPriceChart
+            theme={effectiveTheme}
+            source={"binance"}
+            targetPrice={targetPrice}
+            onPrice={handleBtcOnPrice}
+          />
         </div>
 
         <div key={polyChartKey} className="h-full w-full relative">
@@ -590,8 +636,18 @@ export default function Page() {
       </div>
 
       <div className="grid gap-6 lg:grid-cols-2">
-        <Hit80StatsChart theme={effectiveTheme} marketBase={marketBase.trim()} anchorStartTsSec={resolved?.startTsSec ?? null} count={historySlugs} />
-        <TaAccuracyChart theme={effectiveTheme} marketBase={marketBase.trim()} anchorStartTsSec={resolved?.startTsSec ?? null} count={historySlugs} />
+        <Hit80StatsChart
+          theme={effectiveTheme}
+          marketBase={marketBase.trim()}
+          anchorStartTsSec={resolved?.startTsSec ?? null}
+          count={historySlugs}
+        />
+        <TaAccuracyChart
+          theme={effectiveTheme}
+          marketBase={marketBase.trim()}
+          anchorStartTsSec={resolved?.startTsSec ?? null}
+          count={historySlugs}
+        />
       </div>
 
       <section className="space-y-3">
@@ -608,10 +664,11 @@ export default function Page() {
             <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
               Hits: <span className="font-mono">{hitMissStats.hits}</span> | Misses:{" "}
               <span className="font-mono">{hitMissStats.misses}</span> | Total scored:{" "}
-              <span className="font-mono">{hitMissStats.total}</span>
-              {" "}
+              <span className="font-mono">{hitMissStats.total}</span>{" "}
               <span className="text-zinc-500">
-                ({hitMissStats.total === 0 ? "—" : `${hitMissStats.hits}/${hitMissStats.total} = ${hitRatePct.toFixed(1)}%`})
+                ({hitMissStats.total === 0
+                  ? "—"
+                  : `${hitMissStats.hits}/${hitMissStats.total} = ${hitRatePct.toFixed(1)}%`})
               </span>
             </div>
           </div>
@@ -619,7 +676,8 @@ export default function Page() {
           <div className="rounded-xl bg-white p-4 ring-1 ring-zinc-200 dark:bg-zinc-900/40 dark:ring-zinc-800">
             <div className="text-sm font-medium text-zinc-800 dark:text-zinc-200">TA Correctness (Window=30)</div>
             <div className="mt-1 text-2xl font-semibold">
-              {taAccuracyPct.toFixed(1)}% <span className="text-sm font-normal text-zinc-500">({taTotalSignals} signals)</span>
+              {taAccuracyPct.toFixed(1)}%{" "}
+              <span className="text-sm font-normal text-zinc-500">({taTotalSignals} signals)</span>
             </div>
           </div>
 
@@ -633,7 +691,12 @@ export default function Page() {
         </div>
 
         <div className={splitTables ? "grid gap-6 lg:grid-cols-2 items-start" : "grid gap-6"}>
-          <TaAnalysisTable events={marketEvents} taAccuracy={taAccuracyPct} totalSignals={taTotalSignals} onEventClick={setSelectedEvent} />
+          <TaAnalysisTable
+            events={marketEvents}
+            taAccuracy={taAccuracyPct}
+            totalSignals={taTotalSignals}
+            onEventClick={setSelectedEvent}
+          />
           <TaPredictionTable rows={taPredRows} />
         </div>
       </section>
@@ -658,7 +721,9 @@ export default function Page() {
                   <td className="px-4 py-3 text-zinc-900 dark:text-zinc-200">{r.name}</td>
                   <td className="px-4 py-3 font-mono text-zinc-900 dark:text-zinc-200">{r.value}</td>
                   <td className="px-4 py-3">
-                    <span className={`inline-flex rounded-full px-3 py-1 text-xs ${pillClasses(r.signal)}`}>{r.signal}</span>
+                    <span className={`inline-flex rounded-full px-3 py-1 text-xs ${pillClasses(r.signal)}`}>
+                      {r.signal}
+                    </span>
                   </td>
                   <td className="px-4 py-3 text-zinc-600 dark:text-zinc-400">{r.note ?? "-"}</td>
                 </tr>
@@ -677,5 +742,3 @@ export default function Page() {
     </main>
   );
 }
-
-
