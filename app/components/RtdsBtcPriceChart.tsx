@@ -10,6 +10,7 @@ import {
   UTCTimestamp,
   LogicalRange,
   LineStyle,
+  IPriceLine,
 } from "lightweight-charts";
 
 type Props = {
@@ -29,11 +30,26 @@ export default function RtdsBtcPriceChart({ theme, onPrice }: Props) {
   // Dummy series for Left-side "Price To Beat" label
   const leftSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
 
+  const priceLineRef = useRef<IPriceLine | null>(null);
+
   const esRef = useRef<EventSource | null>(null);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const startedRef = useRef(false);
   const hasFittedRef = useRef(false);
   const priceToBeatRef = useRef<number | null>(null);
+
+  // “Follow realtime” behavior: true only when user is at right edge
+  const autoFollowRef = useRef(true);
+
+  // Staleness detection: if we stop receiving ticks, reconnect when visible
+  const lastTickAtMsRef = useRef<number>(0);
+
+  // Avoid effect re-subscribe when onPrice changes
+  const onPriceRef = useRef<Props["onPrice"]>(onPrice);
+  useEffect(() => {
+    onPriceRef.current = onPrice;
+  }, [onPrice]);
 
   const [status, setStatus] = useState("Idle");
   const [lastIso, setLastIso] = useState("-");
@@ -48,6 +64,121 @@ export default function RtdsBtcPriceChart({ theme, onPrice }: Props) {
       line: dark ? "#f59e0b" : "#d97706",
     };
   }, [theme]);
+
+  const clearReconnectTimer = () => {
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+  };
+
+  const closeStream = () => {
+    clearReconnectTimer();
+    if (esRef.current) {
+      esRef.current.close();
+      esRef.current = null;
+    }
+  };
+
+  const followRightEdge = () => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    chart.timeScale().scrollToRealTime();
+  };
+
+  const scheduleReconnect = (delayMs: number) => {
+    if (reconnectTimerRef.current) return;
+    reconnectTimerRef.current = setTimeout(() => {
+      reconnectTimerRef.current = null;
+      openStream();
+    }, delayMs);
+  };
+
+  const openStream = () => {
+    // Don’t try to stream if chart isn’t ready
+    if (!chartRef.current || !seriesRef.current || !leftSeriesRef.current) return;
+
+    closeStream();
+    setStatus("Connecting…");
+
+    const es = new EventSource(`/api/stream-btc?t=${Date.now()}`);
+    esRef.current = es;
+
+    es.onopen = () => {
+      setStatus("Streaming");
+      // When a fresh connection opens, re-pin to realtime if in follow mode.
+      if (autoFollowRef.current) followRightEdge();
+    };
+
+    es.onmessage = (ev) => {
+      try {
+        const msg: any = JSON.parse(ev.data);
+
+        if (msg?.type === "status") {
+          setStatus(String(msg.status));
+          return;
+        }
+        if (msg?.type === "ping") return;
+        if (msg?.type !== "tick") return;
+
+        const price = Number(msg.value ?? msg.price);
+        const tsMs = Number(msg.tsMs);
+
+        if (!Number.isFinite(tsMs) || !Number.isFinite(price)) return;
+
+        lastTickAtMsRef.current = Date.now();
+
+        const t = Math.floor(tsMs / 1000) as UTCTimestamp;
+        const pt: LineData = { time: t, value: price };
+
+        // Update main series (right)
+        seriesRef.current?.update(pt);
+
+        // Update dummy series (left) to keep left scale alive
+        leftSeriesRef.current?.update(pt);
+
+        setLastPrice(price);
+        setLastIso(new Date(tsMs).toISOString());
+        onPriceRef.current?.(price, tsMs);
+
+        // Create “Price To Beat” once (and keep a handle to update styling)
+        if (priceToBeatRef.current === null && leftSeriesRef.current) {
+          priceToBeatRef.current = price;
+
+          priceLineRef.current = leftSeriesRef.current.createPriceLine({
+            price,
+            color: colors.text,
+            lineWidth: 1,
+            lineStyle: LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: "Price To Beat",
+          });
+        }
+
+        // Initial fit (roughly last ~300 points)
+        if (!hasFittedRef.current && chartRef.current) {
+          hasFittedRef.current = true;
+          chartRef.current.timeScale().setVisibleLogicalRange({ from: -300, to: 10 } as LogicalRange);
+        }
+
+        // Only force-scroll when we’re in follow mode
+        if (autoFollowRef.current) followRightEdge();
+      } catch {
+        // ignore
+      }
+    };
+
+    es.onerror = () => {
+      setStatus("Reconnecting...");
+      try {
+        es.close();
+      } catch {
+        // ignore
+      }
+      // In practice, reconnecting explicitly avoids “stuck” streams in some failure modes.
+      scheduleReconnect(1500);
+    };
+  };
 
   // 1) Initialize chart
   useEffect(() => {
@@ -93,8 +224,7 @@ export default function RtdsBtcPriceChart({ theme, onPrice }: Props) {
       crosshairMarkerVisible: true,
     });
 
-    // Dummy Series (Left) — DO NOT use lineWidth: 0 (invalid type in LWC typings).
-    // Hide it via lineVisible: false.
+    // Dummy Series (Left)
     leftSeriesRef.current = chart.addLineSeries({
       color: "transparent",
       lineVisible: false,
@@ -105,6 +235,14 @@ export default function RtdsBtcPriceChart({ theme, onPrice }: Props) {
       crosshairMarkerVisible: false,
     });
 
+    // Track whether user is at right edge; if they scroll away, stop forcing follow.
+    const ts = chart.timeScale();
+    const onVisibleRangeChange = () => {
+      const pos = ts.scrollPosition(); // distance from right edge in bars
+      autoFollowRef.current = pos <= 2;
+    };
+    ts.subscribeVisibleLogicalRangeChange(onVisibleRangeChange);
+
     const ro = new ResizeObserver(() => {
       if (elRef.current && chartRef.current) {
         chartRef.current.applyOptions({ width: elRef.current.clientWidth });
@@ -114,6 +252,10 @@ export default function RtdsBtcPriceChart({ theme, onPrice }: Props) {
 
     return () => {
       ro.disconnect();
+      ts.unsubscribeVisibleLogicalRangeChange(onVisibleRangeChange);
+
+      closeStream();
+
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
@@ -121,86 +263,75 @@ export default function RtdsBtcPriceChart({ theme, onPrice }: Props) {
 
       hasFittedRef.current = false;
       priceToBeatRef.current = null;
+      priceLineRef.current = null;
     };
-  }, [colors]);
+  }, [colors]); // theme change recreates chart like your original
 
-  // 2) Stream logic
+  // 2) Start stream (once chart exists)
   useEffect(() => {
     if (startedRef.current) return;
     startedRef.current = true;
 
-    setStatus("Connecting…");
+    lastTickAtMsRef.current = Date.now();
+    openStream();
 
-    const es = new EventSource(`/api/stream-btc?t=${Date.now()}`);
-    esRef.current = es;
+    return () => {
+      startedRef.current = false;
+      closeStream();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-    es.onmessage = (ev) => {
-      try {
-        const msg: any = JSON.parse(ev.data);
+  // 3) On tab refocus/visibility: re-enable follow + re-pin + reconnect if stale
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
 
-        if (msg?.type === "status") {
-          setStatus(String(msg.status));
-          return;
-        }
-        if (msg?.type === "ping") return;
-        if (msg?.type !== "tick") return;
+      autoFollowRef.current = true;
+      followRightEdge();
 
-        const price = Number(msg.value ?? msg.price);
-        const tsMs = Number(msg.tsMs);
-
-        if (!Number.isFinite(tsMs) || !Number.isFinite(price)) return;
-
-        const t = Math.floor(tsMs / 1000) as UTCTimestamp;
-        const pt: LineData = { time: t, value: price };
-
-        // Update main series (right)
-        seriesRef.current?.update(pt);
-
-        // Update dummy series (left) to keep left scale “alive”
-        leftSeriesRef.current?.update(pt);
-
-        setLastPrice(price);
-        setLastIso(new Date(tsMs).toISOString());
-        onPrice?.(price, tsMs);
-
-        // Add “Price To Beat” line once on LEFT axis
-        if (priceToBeatRef.current === null && leftSeriesRef.current) {
-          priceToBeatRef.current = price;
-
-          leftSeriesRef.current.createPriceLine({
-            price,
-            color: colors.text,
-            lineWidth: 1,
-            lineStyle: LineStyle.Dashed,
-            axisLabelVisible: true,
-            title: "Price To Beat",
-          });
-        }
-
-        // Initial fit (roughly last ~300 points), then keep pinned to latest
-        if (!hasFittedRef.current && chartRef.current) {
-          hasFittedRef.current = true;
-          chartRef.current.timeScale().setVisibleLogicalRange({ from: -300, to: 10 } as LogicalRange);
-        }
-
-        // Keep latest data visible (prevents “stuck on the left” after refresh)
-        chartRef.current?.timeScale().scrollToRealTime();
-      } catch {
-        // ignore
+      // If we haven't received ticks recently, force a reconnect.
+      const ageMs = Date.now() - (lastTickAtMsRef.current || 0);
+      if (ageMs > 15_000) {
+        setStatus("Reconnecting...");
+        openStream();
       }
     };
 
-    es.onerror = () => {
-      setStatus("Stream dropped/error");
-      es.close();
-    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
 
     return () => {
-      es.close();
-      esRef.current = null;
-      startedRef.current = false;
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
     };
-  }, [onPrice, colors.text]);
+  }, []);
+
+  // 4) If theme changes after the “Price To Beat” line exists, update its color
+  useEffect(() => {
+    if (!priceLineRef.current) return;
+    // Lightweight Charts price lines don’t have a direct “setOptions” on all versions,
+    // so simplest is: remove + recreate if you want perfect theme sync.
+    // We’ll keep it minimal: only recreate if we still have the left series & stored price.
+    const left = leftSeriesRef.current;
+    const price = priceToBeatRef.current;
+    if (!left || price == null) return;
+
+    try {
+      left.removePriceLine(priceLineRef.current);
+    } catch {
+      // ignore
+    }
+
+    priceLineRef.current = left.createPriceLine({
+      price,
+      color: colors.text,
+      lineWidth: 1,
+      lineStyle: LineStyle.Dashed,
+      axisLabelVisible: true,
+      title: "Price To Beat",
+    });
+  }, [colors.text]);
 
   return (
     <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 overflow-hidden">
@@ -211,7 +342,21 @@ export default function RtdsBtcPriceChart({ theme, onPrice }: Props) {
             {lastPrice == null ? "" : ` — $${lastPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}`}
           </span>
         </span>
-        <span className="text-xs text-zinc-600 dark:text-zinc-400">{status}</span>
+
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-zinc-600 dark:text-zinc-400">{status}</span>
+          <button
+            type="button"
+            onClick={() => {
+              autoFollowRef.current = true;
+              followRightEdge();
+            }}
+            className="rounded-md px-2 py-1 text-xs ring-1 ring-zinc-200 text-zinc-700 hover:bg-zinc-50
+                       dark:ring-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-900"
+          >
+            Go realtime
+          </button>
+        </div>
       </div>
 
       <div className="bg-white dark:bg-zinc-950 relative">
