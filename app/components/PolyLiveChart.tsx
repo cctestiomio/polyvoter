@@ -20,6 +20,21 @@ type Props = {
   onNoMid?: (mid: number) => void;
 };
 
+// Helper: Fetch history safely
+async function fetchTokenHistory(tokenId: string, startTs: number, endTs: number) {
+  try {
+    // Try our internal proxy first to avoid CORS
+    const res = await fetch(
+      `/api/poly-history?tokenId=${tokenId}&startTs=${startTs}&endTs=${endTs}`
+    );
+    if (!res.ok) return [];
+    const json = await res.json();
+    return json.history || [];
+  } catch {
+    return [];
+  }
+}
+
 export default function PolyLiveChart({
   theme,
   yesTokenId,
@@ -33,8 +48,10 @@ export default function PolyLiveChart({
   const yesSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   const noSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
 
-  // Connection guard
-  const startedRef = useRef(false);
+  // Connection guard & Reconnect refs
+  const eventSourceRef = useRef<EventSource | null>(null);
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const isUnmountedRef = useRef(false);
   
   // Track if we have set the initial 5m range
   const hasFittedRef = useRef(false);
@@ -55,7 +72,7 @@ export default function PolyLiveChart({
     };
   }, [theme]);
 
-  // 1. Initialize Chart
+  // 1. Initialize Chart (EXACTLY as you provided)
   useEffect(() => {
     if (!elRef.current) return;
 
@@ -115,39 +132,96 @@ export default function PolyLiveChart({
     };
   }, [colors]);
 
-  // Reset guard when tokens change
-  useEffect(() => {
-    startedRef.current = false;
-    hasFittedRef.current = false;
-  }, [yesTokenId, noTokenId]);
+  // 2. Robust Connection Logic (Backfill + Reconnect + Stream)
+  const connect = async () => {
+    if (isUnmountedRef.current || !yesTokenId || !noTokenId) return;
 
-  // 2. Stream Logic
-  useEffect(() => {
-    if (startedRef.current) return;
-    if (!yesTokenId || !noTokenId) {
-      setStatus("Missing token ids");
-      return;
+    // Cleanup any existing connection before starting new one
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
     }
 
-    startedRef.current = true;
-    setStatus("Connecting…");
-    setYesMid(null);
-    setNoMid(null);
-    setLastIso("-");
+    setStatus("Loading history...");
 
-    // Clear old data
-    if (yesSeriesRef.current) yesSeriesRef.current.setData([]);
-    if (noSeriesRef.current) noSeriesRef.current.setData([]);
+    // --- A. BACKFILL HISTORY (New Robust Logic) ---
+    try {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const startSec = nowSec - 21600; // Fetch last 6 hours to be safe
+
+      const [yesHist, noHist] = await Promise.all([
+        fetchTokenHistory(yesTokenId, startSec, nowSec),
+        fetchTokenHistory(noTokenId, startSec, nowSec),
+      ]);
+
+      if (isUnmountedRef.current) return;
+
+      // Populate YES Series
+      if (yesSeriesRef.current && yesHist.length > 0) {
+        const data = yesHist
+          .map((p: any) => ({ time: Number(p.t) as UTCTimestamp, value: Number(p.p) }))
+          .sort((a, b) => a.time - b.time)
+          .filter((v, i, a) => i === 0 || v.time !== a[i - 1].time); // Dedupe
+        yesSeriesRef.current.setData(data);
+        
+        if (data.length > 0) {
+            const val = data[data.length - 1].value;
+            setYesMid(val);
+            onYesMid?.(val);
+        }
+      }
+
+      // Populate NO Series
+      if (noSeriesRef.current && noHist.length > 0) {
+        const data = noHist
+          .map((p: any) => ({ time: Number(p.t) as UTCTimestamp, value: Number(p.p) }))
+          .sort((a, b) => a.time - b.time)
+          .filter((v, i, a) => i === 0 || v.time !== a[i - 1].time); // Dedupe
+        noSeriesRef.current.setData(data);
+
+        if (data.length > 0) {
+            const val = data[data.length - 1].value;
+            setNoMid(val);
+            onNoMid?.(val);
+        }
+      }
+
+      // --- B. APPLY YOUR EXACT 5-MINUTE VIEW LOGIC ---
+      // We apply this immediately after history load so the user sees data right away.
+      if (!hasFittedRef.current && chartRef.current) {
+        hasFittedRef.current = true;
+        
+        // Exact logic you liked:
+        chartRef.current.timeScale().setVisibleLogicalRange({
+          from: -300, 
+          to: 10,
+        } as LogicalRange);
+      }
+
+    } catch (e) {
+      console.error("History fetch error:", e);
+      // Continue to streaming even if history fails
+    }
+
+    // --- C. START STREAMING ---
+    if (isUnmountedRef.current) return;
+    setStatus("Connecting stream…");
 
     const url = `/api/stream-midpoints?yes=${encodeURIComponent(
       yesTokenId
     )}&no=${encodeURIComponent(noTokenId)}&t=${Date.now()}`;
 
     const es = new EventSource(url);
+    eventSourceRef.current = es;
+
+    es.onopen = () => setStatus("Streaming");
 
     es.onmessage = (ev) => {
       try {
         const msg = JSON.parse(ev.data);
+
+        // Keep-alive / Ping handling
+        if (msg.type === "ping") return; 
 
         if (msg.type === "status") {
           setStatus(String(msg.status));
@@ -183,14 +257,10 @@ export default function PolyLiveChart({
 
         if (updated) {
           setLastIso(new Date(tsMs).toISOString());
-          setStatus("streaming");
-
-          // FORCE 5-MINUTE VIEW on first data point
+          
+          // Re-apply view logic ONLY if not yet applied (fallback)
           if (!hasFittedRef.current && chartRef.current) {
             hasFittedRef.current = true;
-            
-            // Set range from -300 (5 mins ago) to +10 (future buffer)
-            // This forces the chart to display empty space to the left
             chartRef.current.timeScale().setVisibleLogicalRange({
               from: -300, 
               to: 10,
@@ -198,17 +268,47 @@ export default function PolyLiveChart({
           }
         }
       } catch {
-        // ignore
+        // ignore parse errors
       }
     };
 
-    es.onerror = () => setStatus("SSE error");
+    es.onerror = () => {
+      setStatus("Reconnecting...");
+      es.close();
+      if (!isUnmountedRef.current) {
+        // Retry connection in 3s
+        reconnectTimeoutRef.current = setTimeout(connect, 3000);
+      }
+    };
+  };
+
+  // 3. Trigger Connection on Token Change
+  useEffect(() => {
+    isUnmountedRef.current = false;
+    hasFittedRef.current = false;
+    
+    if (yesTokenId && noTokenId) {
+       // Clear old data first
+       if (yesSeriesRef.current) yesSeriesRef.current.setData([]);
+       if (noSeriesRef.current) noSeriesRef.current.setData([]);
+       
+       connect();
+    } else {
+       setStatus("Missing token ids");
+    }
 
     return () => {
-      es.close();
-      startedRef.current = false;
+      isUnmountedRef.current = true;
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
     };
-  }, [yesTokenId, noTokenId, onYesMid, onNoMid]);
+  }, [yesTokenId, noTokenId]); 
+  // removed onYesMid/onNoMid from dep array to avoid re-connecting on callback change
 
   return (
     <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 overflow-hidden">

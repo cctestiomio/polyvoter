@@ -83,7 +83,7 @@ export default function TaAccuracyChart({ theme, marketBase, anchorStartTsSec, c
         const res = await fetch(
           `/api/poly-ta-accuracy?marketBase=${encodeURIComponent(marketBase)}` +
             `&anchorStartTsSec=${encodeURIComponent(String(anchorStartTsSec))}` +
-            `&count=${encodeURIComponent(String(count))}&window=30&fidelity=1`,
+            `&count=${encodeURIComponent(String(count))}&window=45&fidelity=1`,
           { cache: "no-store" }
         );
         const text = await res.text();
@@ -132,7 +132,7 @@ export default function TaAccuracyChart({ theme, marketBase, anchorStartTsSec, c
   return (
     <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 overflow-hidden">
       <div className="px-4 py-3 text-sm font-medium bg-white text-zinc-800 dark:bg-zinc-900/40 dark:text-zinc-200 flex items-center justify-between">
-        <span>TA correctness by slug (window=30)</span>
+        <span>TA correctness by slug (window=45)</span>
         <span className="text-xs text-zinc-600 dark:text-zinc-400">
           {status} | Accuracy: <span className="font-mono">{correct}/{scored}</span> = <span className="font-mono">{accText}</span>
         </span>

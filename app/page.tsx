@@ -1,12 +1,14 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTheme } from "next-themes";
 
 import RtdsBtcPriceChart from "./components/RtdsBtcPriceChart";
 import PolyLiveChart from "./components/PolyLiveChart";
 import Hit80StatsChart from "./components/Hit80StatsChart";
 import TaAccuracyChart from "./components/TaAccuracyChart";
+import TaAnalysisTable, { MarketEvent } from "./components/TaAnalysisTable";
+import TaPredictionTable, { TaPredRow } from "./components/TaPredictionTable";
 
 import type { Candle, IndicatorRow, Prediction, Signal } from "@/lib/types";
 import { computeIndicators } from "@/lib/analyze";
@@ -17,14 +19,8 @@ function pillClasses(sig: Signal) {
   return "bg-zinc-500/15 text-zinc-700 ring-1 ring-zinc-500/30 dark:text-zinc-300";
 }
 
-type TAState = {
-  indicators: IndicatorRow[];
-  prediction: Prediction;
-  lastClose: number;
-};
-
+type TAState = { indicators: IndicatorRow[]; prediction: Prediction; lastClose: number };
 type BucketMode = "next" | "current";
-
 type ResolveResp = {
   desiredSlug: string;
   resolvedSlug: string;
@@ -44,7 +40,11 @@ function errToText(x: any) {
   if (!x) return "Unknown error";
   if (typeof x === "string") return x;
   if (typeof x?.message === "string") return x.message;
-  try { return JSON.stringify(x); } catch { return String(x); }
+  try {
+    return JSON.stringify(x);
+  } catch {
+    return String(x);
+  }
 }
 
 function pointsToCandles(points: Array<{ tMs: number; p: number }>, stepMs: number): Candle[] {
@@ -58,7 +58,7 @@ function pointsToCandles(points: Array<{ tMs: number; p: number }>, stepMs: numb
       low: pt.p,
       close: pt.p,
       volume: 0,
-      closeTime: pt.tMs + stepMs
+      closeTime: pt.tMs + stepMs,
     }));
 }
 
@@ -70,6 +70,154 @@ function majorityVerdict(pred: Prediction | null | undefined): Signal {
   return "NEUTRAL";
 }
 
+function TradingViewWidget() {
+  const container = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!container.current) return;
+    container.current.innerHTML = "";
+
+    const script = document.createElement("script");
+    script.src = "https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js";
+    script.type = "text/javascript";
+    script.async = true;
+    script.innerHTML = JSON.stringify({
+      autosize: true,
+      symbol: "BINANCE:BTCUSDT",
+      interval: "5",
+      timezone: "America/Los_Angeles",
+      theme: "light",
+      style: "1",
+      locale: "en",
+      enable_publishing: false,
+      hide_top_toolbar: false,
+      save_image: false,
+      calendar: false,
+      hide_volume: true,
+      studies: ["RSI@tv-basicstudies", "MASimple@tv-basicstudies"],
+      support_host: "https://www.tradingview.com",
+    });
+
+    container.current.appendChild(script);
+  }, []);
+
+  return (
+    <div
+      className="h-[500px] w-full rounded-xl overflow-hidden ring-1 ring-zinc-200 dark:ring-zinc-800 bg-white"
+      ref={container}
+    />
+  );
+}
+
+function coerceYesNo(x: any): "Yes" | "No" | null {
+  const v = String(x ?? "").trim().toLowerCase();
+  if (v === "yes" || v === "up" || v === "true") return "Yes";
+  if (v === "no" || v === "down" || v === "false") return "No";
+  return null;
+}
+
+function coercePredictionToYesNoNeutral(x: any): "Yes" | "No" | "Neutral" | null {
+  const v = String(x ?? "").trim().toLowerCase();
+  if (!v) return null;
+  if (v === "yes" || v === "up" || v === "bull" || v === "long") return "Yes";
+  if (v === "no" || v === "down" || v === "bear" || v === "short") return "No";
+  if (v === "neutral" || v === "flat") return "Neutral";
+  return null;
+}
+
+function parseEventsFromHit80(hit80Json: any): MarketEvent[] {
+  const rows = Array.isArray(hit80Json?.rows) ? hit80Json.rows : [];
+  const out: MarketEvent[] = [];
+
+  for (const r of rows) {
+    if (!r || typeof r !== "object") continue;
+
+    const slug = String(r.slug ?? "").trim();
+    const startTsSec = Number(r.startTsSec);
+    const endTsSec = Number.isFinite(Number(r.endTsSec)) ? Number(r.endTsSec) : startTsSec + 300;
+    if (!slug || !Number.isFinite(startTsSec) || !Number.isFinite(endTsSec)) continue;
+
+    const hitSide = coerceYesNo(r?.firstHit?.side);
+    const hitPrice = r?.firstHit?.p == null ? null : Number(r.firstHit.p);
+
+    const outcomeKnown = Boolean(r?.outcomeKnown);
+    const resolvedWinner = coerceYesNo(r?.resolvedWinner);
+
+    out.push({
+      slug,
+      startTsSec,
+      endTsSec,
+      hitSide,
+      hitPrice: Number.isFinite(hitPrice as any) ? (hitPrice as number) : null,
+      outcome: outcomeKnown && resolvedWinner ? resolvedWinner : "Open",
+    });
+  }
+
+  out.sort((a, b) => Number(b.startTsSec ?? 0) - Number(a.startTsSec ?? 0));
+  return out;
+}
+
+function parseTaSummary(taJson: any): { accuracyPct: number; totalSignals: number } {
+  const accuracyPct =
+    (Number.isFinite(taJson?.accuracyPct) && Number(taJson.accuracyPct)) ||
+    (Number.isFinite(taJson?.pct) && Number(taJson.pct)) ||
+    (Number.isFinite(taJson?.accuracy) && Number(taJson.accuracy)) ||
+    0;
+
+  const totalSignals =
+    (Number.isFinite(taJson?.totalSignals) && Number(taJson.totalSignals)) ||
+    (Number.isFinite(taJson?.signals) && Number(taJson.signals)) ||
+    (Number.isFinite(taJson?.total) && Number(taJson.total)) ||
+    0;
+
+  return { accuracyPct, totalSignals };
+}
+
+/**
+ * KEY FIX:
+ * - Parse TA rows from taJson
+ * - Fill `outcome` using outcomesBySlug from the Event Log (poly-hit80), so it doesn't stay Pending.
+ */
+function parseTaRowsToTable(taJson: any, outcomesBySlug: Map<string, "Yes" | "No">): TaPredRow[] {
+  const rows = Array.isArray(taJson?.rows) ? taJson.rows : Array.isArray(taJson?.perSlug) ? taJson.perSlug : [];
+  const out: TaPredRow[] = [];
+
+  for (const r of rows) {
+    if (!r || typeof r !== "object") continue;
+
+    const slug = String(r.slug ?? r.marketSlug ?? r.resolvedSlug ?? "").trim();
+    if (!slug) continue;
+
+    const startTsSec =
+      (Number.isFinite(Number(r.startTsSec)) && Number(r.startTsSec)) ||
+      (Number.isFinite(Number(r.tsSec)) && Number(r.tsSec)) ||
+      Number(slug.split("-").pop());
+
+    if (!Number.isFinite(startTsSec)) continue;
+    const endTsSec = (Number.isFinite(Number(r.endTsSec)) && Number(r.endTsSec)) || startTsSec + 300;
+
+    const prediction =
+      coercePredictionToYesNoNeutral(r.prediction) ??
+      coercePredictionToYesNoNeutral(r.predictedSide) ??
+      coercePredictionToYesNoNeutral(r.signal) ??
+      coercePredictionToYesNoNeutral(r.verdict) ??
+      null;
+
+    const outcomeFromEventLog = outcomesBySlug.get(slug) ?? null;
+
+    out.push({
+      slug,
+      startTsSec,
+      endTsSec,
+      prediction,
+      outcome: outcomeFromEventLog ? outcomeFromEventLog : "Open",
+    });
+  }
+
+  out.sort((a, b) => b.startTsSec - a.startTsSec);
+  return out;
+}
+
 export default function Page() {
   const [mounted, setMounted] = useState(false);
   const { theme, setTheme } = useTheme();
@@ -79,72 +227,75 @@ export default function Page() {
   const [bucketMode, setBucketMode] = useState<BucketMode>("current");
   const [autoTimestamp, setAutoTimestamp] = useState(true);
   const [tsSec, setTsSec] = useState<number>(() => latest5mStartEpochSec("current"));
-
-  const [btcSource, setBtcSource] = useState<"binance" | "chainlink">("binance");
   const [historySlugs, setHistorySlugs] = useState<number>(70);
 
+  const [splitTables, setSplitTables] = useState(true);
+
   const [resolved, setResolved] = useState<ResolveResp | null>(null);
+  const [resolveStatus, setResolveStatus] = useState<string>("Idle");
   const [err, setErr] = useState<string | null>(null);
 
   const [yesMid, setYesMid] = useState<number | null>(null);
   const [noMid, setNoMid] = useState<number | null>(null);
-  const [wsTicks, setWsTicks] = useState(0);
 
   const [targetPrice, setTargetPrice] = useState<number | null>(null);
   const lastBeforeStartRef = useRef<{ tsMs: number; px: number } | null>(null);
 
   const [ta, setTa] = useState<TAState | null>(null);
 
+  const [marketEvents, setMarketEvents] = useState<MarketEvent[]>([]);
+  const [taAccuracyPct, setTaAccuracyPct] = useState<number>(0);
+  const [taTotalSignals, setTaTotalSignals] = useState<number>(0);
+  const [taPredRows, setTaPredRows] = useState<TaPredRow[]>([]);
+
+  const [eventLogStatus, setEventLogStatus] = useState<string>("Idle");
+  const [eventLogErr, setEventLogErr] = useState<string | null>(null);
+
+  const [selectedEvent, setSelectedEvent] = useState<MarketEvent | null>(null);
+
   useEffect(() => setMounted(true), []);
 
   useEffect(() => {
     if (!autoTimestamp) return;
-    const tick = () => setTsSec(latest5mStartEpochSec(bucketMode));
+    const tick = () => {
+      const next = latest5mStartEpochSec(bucketMode);
+      setTsSec((prev) => (prev === next ? prev : next));
+    };
     tick();
     const t = window.setInterval(tick, 1000);
     return () => window.clearInterval(t);
   }, [autoTimestamp, bucketMode]);
 
-  // Logic: refresh chart group every 2 slugs (every 10 minutes)
-  const chartRefreshKey = useMemo(() => {
-    const slugIndex = Math.floor(tsSec / 300); // 5m slug index
-    return Math.floor(slugIndex / 2); // integer changes every 2 slugs
-  }, [tsSec]);
-
   const desiredSlug = useMemo(() => {
     const base = marketBase.trim().replace(/-+$/g, "");
-    if (!base) return "";
-    return `${base}-${tsSec}`;
+    return base ? `${base}-${tsSec}` : "";
   }, [marketBase, tsSec]);
 
-  // Resolve slug
+  // Resolve market
   useEffect(() => {
     let ignore = false;
+    const base = marketBase.trim();
+    if (!base) return;
 
     async function run() {
-      const base = marketBase.trim();
-      if (!base) {
-        setResolved(null);
-        setErr(null);
-        return;
-      }
-
       setErr(null);
-      setResolved(null);
-
+      setResolveStatus("Resolving...");
       try {
         const res = await fetch(
-          `/api/poly-resolve?marketBase=${encodeURIComponent(base)}&desiredStartTsSec=${encodeURIComponent(
-            String(tsSec)
-          )}&lookbackIntervals=120`,
-          { cache: "no-store" }
+          `/api/poly-resolve?marketBase=${encodeURIComponent(base)}&desiredStartTsSec=${encodeURIComponent(String(tsSec))}&lookbackIntervals=120`,
+          { cache: "no-store" } // ensure fresh [web:90]
         );
-        const text = await res.text();
-        const json = text ? JSON.parse(text) : null;
+        const json = await res.json().catch(() => null);
         if (!res.ok) throw new Error(errToText(json?.error ?? json));
-        if (!ignore) setResolved(json);
+        if (!ignore) {
+          setResolved(json);
+          setResolveStatus("Idle");
+        }
       } catch (e: any) {
-        if (!ignore) setErr(errToText(e));
+        if (!ignore) {
+          setErr(errToText(e));
+          setResolveStatus("Error");
+        }
       }
     }
 
@@ -154,19 +305,102 @@ export default function Page() {
     };
   }, [marketBase, tsSec]);
 
-  const yesTokenId = useMemo(
-    () => (resolved?.clobTokenIds?.[0] ? String(resolved.clobTokenIds[0]) : null),
-    [resolved]
-  );
-  const noTokenId = useMemo(
-    () => (resolved?.clobTokenIds?.[1] ? String(resolved.clobTokenIds[1]) : null),
-    [resolved]
-  );
-
+  const yesTokenId = useMemo(() => (resolved?.clobTokenIds?.[0] ? String(resolved.clobTokenIds[0]) : null), [resolved]);
+  const noTokenId = useMemo(() => (resolved?.clobTokenIds?.[1] ? String(resolved.clobTokenIds[1]) : null), [resolved]);
   const windowStartTsSec = useMemo(() => (resolved?.startTsSec ? resolved.startTsSec : null), [resolved]);
   const marketStartMs = useMemo(() => (resolved?.startTsSec ? resolved.startTsSec * 1000 : null), [resolved]);
 
-  // Seed indicators from last 15 slugs
+  const handleBtcOnPrice = useCallback(
+    (px: number, tsMs: number) => {
+      if (!marketStartMs) return;
+      if (tsMs <= marketStartMs) lastBeforeStartRef.current = { px, tsMs };
+      if (targetPrice === null && tsMs >= marketStartMs) {
+        const before = lastBeforeStartRef.current;
+        setTargetPrice(before?.px ?? px);
+      }
+    },
+    [marketStartMs, targetPrice]
+  );
+
+  const handleYesMid = useCallback((mid: number) => setYesMid(mid), []);
+  const handleNoMid = useCallback((mid: number) => setNoMid(mid), []);
+
+  // Fetch hit80 + ta accuracy
+  const eventFetchIdRef = useRef(0);
+
+  useEffect(() => {
+    let alive = true;
+
+    async function run() {
+      setEventLogErr(null);
+
+      const base = marketBase.trim();
+      const anchor = resolved?.startTsSec ?? null;
+
+      if (!base || !anchor) {
+        setEventLogStatus("Waiting for anchor...");
+        return;
+      }
+
+      const fetchId = ++eventFetchIdRef.current;
+      setEventLogStatus("Loading signals...");
+
+      try {
+        const [hit80Res, taRes] = await Promise.all([
+          fetch(
+            `/api/poly-hit80?marketBase=${encodeURIComponent(base)}&anchorStartTsSec=${encodeURIComponent(
+              String(anchor)
+            )}&count=${encodeURIComponent(String(historySlugs))}&threshold=0.8&fidelity=1`,
+            { cache: "no-store" } // ensure fresh [web:90]
+          ),
+          fetch(
+            `/api/poly-ta-accuracy?marketBase=${encodeURIComponent(base)}&anchorStartTsSec=${encodeURIComponent(
+              String(anchor)
+            )}&count=${encodeURIComponent(String(historySlugs))}&window=30&fidelity=1`,
+            { cache: "no-store" } // ensure fresh [web:90]
+          ),
+        ]);
+
+        const hit80Json = await hit80Res.json().catch(() => null);
+        const taJson = await taRes.json().catch(() => null);
+
+        if (!hit80Res.ok) throw new Error(`poly-hit80: ${errToText(hit80Json?.error ?? hit80Json)}`);
+        if (!taRes.ok) throw new Error(`poly-ta-accuracy: ${errToText(taJson?.error ?? taJson)}`);
+
+        const events = parseEventsFromHit80(hit80Json);
+
+        // Build outcome lookup from Event Log (this is what makes TA outcomes load)
+        const outcomesBySlug = new Map<string, "Yes" | "No">();
+        for (const e of events) {
+          if (e.outcome === "Yes" || e.outcome === "No") outcomesBySlug.set(e.slug, e.outcome);
+        }
+
+        const taParsed = parseTaSummary(taJson);
+        const taRows = parseTaRowsToTable(taJson, outcomesBySlug);
+
+        if (!alive) return;
+        if (fetchId !== eventFetchIdRef.current) return;
+
+        setMarketEvents(events);
+        setTaAccuracyPct(taParsed.accuracyPct);
+        setTaTotalSignals(taParsed.totalSignals);
+        setTaPredRows(taRows);
+
+        setEventLogStatus(events.length ? "Idle" : `No events found (response keys: ${Object.keys(hit80Json ?? {}).join(", ")})`);
+      } catch (e: any) {
+        if (!alive) return;
+        setEventLogErr(errToText(e));
+        setEventLogStatus("Error");
+      }
+    }
+
+    run();
+    return () => {
+      alive = false;
+    };
+  }, [marketBase, historySlugs, resolved?.startTsSec]);
+
+  // Seed TA indicators panel
   useEffect(() => {
     let ignore = false;
 
@@ -183,8 +417,8 @@ export default function Page() {
           )}&count=15&fidelity=1&interval=1h`,
           { cache: "no-store" }
         );
-        const text = await res.text();
-        const json = text ? JSON.parse(text) : null;
+
+        const json = await res.json().catch(() => null);
         if (!res.ok) throw new Error(errToText(json?.error ?? json));
 
         const pts = Array.isArray(json?.points) ? json.points : [];
@@ -213,61 +447,36 @@ export default function Page() {
   const verdict = majorityVerdict(ta?.prediction);
   const upVotes = ta?.prediction.up ?? 0;
   const downVotes = ta?.prediction.down ?? 0;
-  const neutralVotes = ta?.prediction.neutral ?? 0;
 
-  const wsTicksRef = useRef(0);
-  const wsTickFlushTimerRef = useRef<number | null>(null);
+  const firstHit80Stats = useMemo(() => {
+    const resolvedRows = marketEvents.filter((e) => e.outcome === "Yes" || e.outcome === "No");
+    const total = resolvedRows.length;
+    const matches = resolvedRows.filter((e) => e.hitSide && e.hitSide === e.outcome).length;
+    const rate = total > 0 ? (matches / total) * 100 : 0;
+    return { total, matches, rate };
+  }, [marketEvents]);
 
-  const bumpWsTicks = useCallback(() => {
-    wsTicksRef.current += 1;
+  const btcChartKey = `btc-${tsSec}`; // refresh every slug
 
-    if (wsTickFlushTimerRef.current != null) return;
-
-    wsTickFlushTimerRef.current = window.setTimeout(() => {
-      wsTickFlushTimerRef.current = null;
-      setWsTicks(wsTicksRef.current);
-    }, 250);
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (wsTickFlushTimerRef.current != null) {
-        window.clearTimeout(wsTickFlushTimerRef.current);
-        wsTickFlushTimerRef.current = null;
-      }
-    };
-  }, []);
-
-  const handleYesMid = useCallback((mid: number) => {
-    setYesMid(mid);
-    bumpWsTicks();
-  }, [bumpWsTicks]);
-
-  const handleNoMid = useCallback((mid: number) => {
-    setNoMid(mid);
-    bumpWsTicks();
-  }, [bumpWsTicks]);
-
-  const handleBtcOnPrice = useCallback((px: number, tsMs: number) => {
-    if (!marketStartMs) return;
-
-    if (tsMs <= marketStartMs) lastBeforeStartRef.current = { px, tsMs };
-
-    if (targetPrice === null && tsMs >= marketStartMs) {
-      const before = lastBeforeStartRef.current;
-      setTargetPrice(before?.px ?? px);
-    }
-  }, [marketStartMs, targetPrice]);
+  const polyChartKey = useMemo(() => {
+    if (selectedEvent) return `poly-drill-${selectedEvent.slug}`;
+    const anchorForKey = resolved?.startTsSec ?? tsSec;
+    const slugIndex = Math.floor(anchorForKey / 300);
+    const twoSlugBlock = Math.floor(slugIndex / 2);
+    return `poly-live-${twoSlugBlock}`;
+  }, [resolved?.startTsSec, tsSec, selectedEvent]);
 
   return (
-    <main className="mx-auto max-w-7xl p-6">
+    <main className="mx-auto max-w-7xl p-6 space-y-6">
       <header className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Polymarket-aligned live TA</h1>
           <p className="text-zinc-600 dark:text-zinc-400">
-            Desired slug: <span className="font-mono">{desiredSlug || "-"}</span>{" "}
-            | Resolved: <span className="font-mono">{resolved?.resolvedSlug ?? "-"}</span>
+            Desired slug: <span className="font-mono">{desiredSlug || "-"}</span> | Resolved:{" "}
+            <span className="font-mono">{resolved?.resolvedSlug ?? "-"}</span>{" "}
+            <span className="ml-2 text-xs text-zinc-500">Resolve: {resolveStatus}</span>
           </p>
+          {err ? <p className="mt-2 text-sm text-rose-600">Error: {err}</p> : null}
         </div>
 
         <button
@@ -280,7 +489,7 @@ export default function Page() {
         </button>
       </header>
 
-      <section className="mt-6 grid gap-3 rounded-xl bg-white p-4 ring-1 ring-zinc-200 dark:bg-zinc-900/40 dark:ring-zinc-800">
+      <section className="grid gap-3 rounded-xl bg-white p-4 ring-1 ring-zinc-200 dark:bg-zinc-900/40 dark:ring-zinc-800">
         <div className="grid gap-3 lg:grid-cols-3">
           <label className="grid gap-1 lg:col-span-2">
             <span className="text-xs text-zinc-600 dark:text-zinc-400">Market base</span>
@@ -306,7 +515,7 @@ export default function Page() {
           </label>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-4">
           <label className="inline-flex items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
             <input type="checkbox" checked={autoTimestamp} onChange={(e) => setAutoTimestamp(e.target.checked)} />
             Auto timestamp
@@ -325,100 +534,90 @@ export default function Page() {
             />
           </label>
 
-          <span className={`inline-flex items-center rounded-full px-3 py-1 text-sm ${pillClasses(verdict)}`}>
-            Verdict: {verdict}
-          </span>
+          <label className="inline-flex items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
+            <input type="checkbox" checked={splitTables} onChange={(e) => setSplitTables(e.target.checked)} />
+            Split tables side-by-side
+          </label>
+
+          <span className={`inline-flex items-center rounded-full px-3 py-1 text-sm ${pillClasses(verdict)}`}>Verdict: {verdict}</span>
 
           <span className="text-xs text-zinc-600 dark:text-zinc-400">
-            Votes (U/D/N): <span className="font-mono">{upVotes}/{downVotes}/{neutralVotes}</span>
+            Votes: <span className="font-mono">{upVotes}U / {downVotes}D</span>
           </span>
 
-          <span className="text-sm text-zinc-700 dark:text-zinc-300">
-            YES: <span className="font-mono">{yesMid === null ? "-" : yesMid.toFixed(4)}</span>
-          </span>
-
-          <span className="text-sm text-zinc-700 dark:text-zinc-300">
-            NO: <span className="font-mono">{noMid === null ? "-" : noMid.toFixed(4)}</span>
-          </span>
-
-          <span className="text-sm text-zinc-600 dark:text-zinc-400">
-            WS ticks: <span className="font-mono">{wsTicks}</span>
-          </span>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-xs text-zinc-600 dark:text-zinc-400">BTC source displayed:</span>
-          <select
-            value={btcSource}
-            onChange={(e) => setBtcSource(e.target.value as any)}
-            className="rounded-lg bg-zinc-50 px-3 py-2 text-sm ring-1 ring-zinc-200 outline-none
-                       dark:bg-zinc-950 dark:ring-zinc-800"
-          >
-            <option value="binance">Binance (btcusdt)</option>
-            <option value="chainlink">Chainlink (btc/usd)</option>
-          </select>
-        </div>
-
-        {resolved?.question ? (
-          <div className="text-sm text-zinc-700 dark:text-zinc-300">
-            <span className="font-medium text-zinc-900 dark:text-zinc-100">{resolved.question}</span>
-            {windowStartTsSec ? (
-              <span className="ml-2 text-xs text-zinc-600 dark:text-zinc-400">
-                Window: <span className="font-mono">{new Date(windowStartTsSec * 1000).toISOString()}</span>
-              </span>
-            ) : null}
+          <div className="flex gap-4 ml-auto">
+            <span className="text-sm font-medium text-green-600 dark:text-green-400">
+              YES: <span className="font-mono">{yesMid === null ? "-" : yesMid.toFixed(4)}</span>
+            </span>
+            <span className="text-sm font-medium text-red-600 dark:text-red-400">
+              NO: <span className="font-mono">{noMid === null ? "-" : noMid.toFixed(4)}</span>
+            </span>
           </div>
-        ) : null}
-
-        {err ? (
-          <div className="rounded-lg bg-rose-500/10 p-3 text-sm text-rose-700 ring-1 ring-rose-500/20 dark:text-rose-200">
-            {err}
-          </div>
-        ) : null}
+        </div>
       </section>
 
-      {/* 
-        Pass chartRefreshKey to key prop to force re-mount every 2 slugs.
-        This resets internal chart state (zoom, data) cleanly.
-      */}
-      <div key={`charts-${chartRefreshKey}`} className="mt-6 grid gap-6 lg:grid-cols-2">
-        <RtdsBtcPriceChart
-          theme={effectiveTheme}
-          source={btcSource}
-          targetPrice={targetPrice}
-          onPrice={handleBtcOnPrice}
-        />
+      <TradingViewWidget />
 
-        <PolyLiveChart
-          theme={effectiveTheme}
-          yesTokenId={yesTokenId}
-          noTokenId={noTokenId}
-          windowStartTsSec={windowStartTsSec}
-          onYesMid={handleYesMid}
-          onNoMid={handleNoMid}
-        />
+      <div className="grid gap-6 lg:grid-cols-2 h-[400px]">
+        <div key={btcChartKey} className="h-full w-full">
+          <RtdsBtcPriceChart theme={effectiveTheme} source={"binance"} targetPrice={targetPrice} onPrice={handleBtcOnPrice} />
+        </div>
+
+        <div key={polyChartKey} className="h-full w-full relative">
+          <PolyLiveChart
+            theme={effectiveTheme}
+            yesTokenId={yesTokenId}
+            noTokenId={noTokenId}
+            windowStartTsSec={windowStartTsSec}
+            onYesMid={handleYesMid}
+            onNoMid={handleNoMid}
+          />
+        </div>
       </div>
 
-      <div className="mt-6 grid gap-6 lg:grid-cols-2">
-        <Hit80StatsChart
-          theme={effectiveTheme}
-          marketBase={marketBase.trim()}
-          anchorStartTsSec={resolved?.startTsSec ?? null}
-          count={historySlugs}
-        />
-        <TaAccuracyChart
-          theme={effectiveTheme}
-          marketBase={marketBase.trim()}
-          anchorStartTsSec={resolved?.startTsSec ?? null}
-          count={historySlugs}
-        />
+      <div className="grid gap-6 lg:grid-cols-2">
+        <Hit80StatsChart theme={effectiveTheme} marketBase={marketBase.trim()} anchorStartTsSec={resolved?.startTsSec ?? null} count={historySlugs} />
+        <TaAccuracyChart theme={effectiveTheme} marketBase={marketBase.trim()} anchorStartTsSec={resolved?.startTsSec ?? null} count={historySlugs} />
       </div>
 
-      <section className="mt-6 overflow-hidden rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800">
+      <section className="space-y-3">
+        <div className="grid gap-3 lg:grid-cols-3">
+          <div className="rounded-xl bg-white p-4 ring-1 ring-zinc-200 dark:bg-zinc-900/40 dark:ring-zinc-800">
+            <div className="text-sm font-medium text-zinc-800 dark:text-zinc-200">First Hit ≥80% Success Rate</div>
+            <div className="mt-1 text-2xl font-semibold">
+              {firstHit80Stats.total === 0 ? "—" : `${firstHit80Stats.rate.toFixed(1)}%`}{" "}
+              <span className="text-sm font-normal text-zinc-500">
+                ({firstHit80Stats.matches}/{firstHit80Stats.total} resolved)
+              </span>
+            </div>
+          </div>
+
+          <div className="rounded-xl bg-white p-4 ring-1 ring-zinc-200 dark:bg-zinc-900/40 dark:ring-zinc-800">
+            <div className="text-sm font-medium text-zinc-800 dark:text-zinc-200">TA Correctness (Window=30)</div>
+            <div className="mt-1 text-2xl font-semibold">
+              {taAccuracyPct.toFixed(1)}% <span className="text-sm font-normal text-zinc-500">({taTotalSignals} signals)</span>
+            </div>
+          </div>
+
+          <div className="rounded-xl bg-white p-4 ring-1 ring-zinc-200 dark:bg-zinc-900/40 dark:ring-zinc-800">
+            <div className="text-sm font-medium text-zinc-800 dark:text-zinc-200">Event Log status</div>
+            <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+              {eventLogStatus}
+              {eventLogErr ? <div className="mt-1 text-rose-600">Error: {eventLogErr}</div> : null}
+            </div>
+          </div>
+        </div>
+
+        <div className={splitTables ? "grid gap-6 lg:grid-cols-2 items-start" : "grid gap-6"}>
+          <TaAnalysisTable events={marketEvents} taAccuracy={taAccuracyPct} totalSignals={taTotalSignals} onEventClick={setSelectedEvent} />
+          <TaPredictionTable rows={taPredRows} />
+        </div>
+      </section>
+
+      <section className="overflow-hidden rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800">
         <div className="bg-white px-4 py-3 text-sm font-medium text-zinc-800 dark:bg-zinc-900/40 dark:text-zinc-200">
           Indicators (seeded from last 15 slugs)
         </div>
-
         <div className="overflow-x-auto bg-white dark:bg-zinc-950">
           <table className="w-full min-w-[820px] text-left text-sm">
             <thead className="bg-zinc-50 text-zinc-600 dark:bg-zinc-950 dark:text-zinc-400">
@@ -429,21 +628,17 @@ export default function Page() {
                 <th className="px-4 py-3">Rule</th>
               </tr>
             </thead>
-
             <tbody>
               {ta?.indicators?.map((r) => (
                 <tr key={r.key} className="border-b border-zinc-200/70 dark:border-zinc-900/70">
                   <td className="px-4 py-3 text-zinc-900 dark:text-zinc-200">{r.name}</td>
                   <td className="px-4 py-3 font-mono text-zinc-900 dark:text-zinc-200">{r.value}</td>
                   <td className="px-4 py-3">
-                    <span className={`inline-flex rounded-full px-3 py-1 text-xs ${pillClasses(r.signal)}`}>
-                      {r.signal}
-                    </span>
+                    <span className={`inline-flex rounded-full px-3 py-1 text-xs ${pillClasses(r.signal)}`}>{r.signal}</span>
                   </td>
                   <td className="px-4 py-3 text-zinc-600 dark:text-zinc-400">{r.note ?? "-"}</td>
                 </tr>
               ))}
-
               {!ta ? (
                 <tr>
                   <td className="px-4 py-6 text-zinc-500" colSpan={4}>
