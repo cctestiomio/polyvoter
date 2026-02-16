@@ -160,7 +160,7 @@ export default function PolyLiveChart({
       if (yesSeriesRef.current && yesHist.length > 0) {
         const data = yesHist
           .map((p: any) => ({ time: Number(p.t) as UTCTimestamp, value: Number(p.p) }))
-          .sort((a, b) => a.time - b.time)
+          .sort((a: LineData, b: LineData) => Number(a.time) - Number(b.time))
           .filter((v, i, a) => i === 0 || v.time !== a[i - 1].time); // Dedupe
         yesSeriesRef.current.setData(data);
         
@@ -175,7 +175,7 @@ export default function PolyLiveChart({
       if (noSeriesRef.current && noHist.length > 0) {
         const data = noHist
           .map((p: any) => ({ time: Number(p.t) as UTCTimestamp, value: Number(p.p) }))
-          .sort((a, b) => a.time - b.time)
+          .sort((a: LineData, b: LineData) => Number(a.time) - Number(b.time))
           .filter((v, i, a) => i === 0 || v.time !== a[i - 1].time); // Dedupe
         noSeriesRef.current.setData(data);
 
@@ -334,3 +334,4 @@ export default function PolyLiveChart({
     </div>
   );
 }
+
