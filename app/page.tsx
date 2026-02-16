@@ -229,7 +229,7 @@ export default function Page() {
   const [tsSec, setTsSec] = useState<number>(() => latest5mStartEpochSec("current"));
   const [historySlugs, setHistorySlugs] = useState<number>(70);
 
-  const [splitTables, setSplitTables] = useState(true);
+  const [splitTables, setSplitTables] = useState(false);
 
   const [resolved, setResolved] = useState<ResolveResp | null>(null);
   const [resolveStatus, setResolveStatus] = useState<string>("Idle");
@@ -596,12 +596,6 @@ export default function Page() {
         <div className="grid gap-3 lg:grid-cols-3">
           <div className="rounded-xl bg-white p-4 ring-1 ring-zinc-200 dark:bg-zinc-900/40 dark:ring-zinc-800">
             <div className="text-sm font-medium text-zinc-800 dark:text-zinc-200">First Hit ≥80% Success Rate</div>
-            <div className="mt-1 text-2xl font-semibold">
-              {firstHit80Stats.total === 0 ? "—" : `${firstHit80Stats.rate.toFixed(1)}%`}{" "}
-              <span className="text-sm font-normal text-zinc-500">
-                ({firstHit80Stats.matches}/{firstHit80Stats.total} resolved)
-              </span>
-            </div>
             <div className="mt-1 text-2xl font-semibold">
               {firstHit80Stats.total === 0 ? "—" : `${firstHit80Stats.rate.toFixed(1)}%`}{" "}
               <span className="text-sm font-normal text-zinc-500">
