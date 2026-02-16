@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { kv } from "@vercel/kv";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,9 +11,14 @@ const Q = z.object({
   threshold: z.coerce.number().min(0.5).max(0.99).default(0.8),
   fidelity: z.coerce.number().int().min(1).max(5).default(1),
 
-  // Optional: if your midpoint recorder keeps recording a bit after the bucket ends,
-  // you can include it in firstHit scanning.
-  graceSec: z.coerce.number().int().min(0).max(600).default(0),
+  // NEW: extend the time window to catch hits shortly after the 5m bucket ends
+  graceSec: z.coerce.number().int().min(0).max(600).default(180),
+
+  // NEW:
+  // - auto: prefer KV (hi-res) if available, else fallback to prices-history (minute)
+  // - prices: force prices-history only (minute)
+  // - kv: KV only (hi-res); if missing, firstHit will be null
+  mode: z.enum(["auto", "prices", "kv"]).default("auto"),
 });
 
 async function fetchJson(url: string, timeoutMs = 15000) {
@@ -79,39 +83,80 @@ function firstHit(history: Array<{ t: number; p: number }>, thr: number) {
   return null;
 }
 
-function inferredWinnerFromOutcomePrices(outcomePrices: number[], closed: any): "YES" | "NO" | null {
-  if (!closed) return null;
-  if (outcomePrices.length < 2) return null;
-
-  const a = outcomePrices[0];
-  const b = outcomePrices[1];
-  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
-
-  const max = Math.max(a, b);
-  const min = Math.min(a, b);
-  if (max >= 0.98 && min <= 0.02) return a > b ? "YES" : "NO";
+function coerceYesNoUpper(x: any): "YES" | "NO" | null {
+  const v = String(x ?? "").trim().toLowerCase();
+  if (v === "yes" || v === "up" || v === "true") return "YES";
+  if (v === "no" || v === "down" || v === "false") return "NO";
   return null;
 }
 
+function inferWinnerFromClosedMarket(m: any): "YES" | "NO" | null {
+  // Prefer explicit fields if they exist (varies by upstream).
+  const explicit =
+    coerceYesNoUpper(m?.resolvedWinner) ??
+    coerceYesNoUpper(m?.resolvedOutcome) ??
+    coerceYesNoUpper(m?.resolved_outcome) ??
+    coerceYesNoUpper(m?.outcome) ??
+    null;
+
+  if (explicit) return explicit;
+
+  // Fall back to outcomePrices/outcomes when closed.
+  if (!m?.closed) return null;
+
+  const outcomePrices = toNumArray(m?.outcomePrices);
+  const outcomes = normalizeStringOrArray(m?.outcomes);
+
+  if (outcomePrices.length >= 2) {
+    const a = outcomePrices[0];
+    const b = outcomePrices[1];
+    if (Number.isFinite(a) && Number.isFinite(b)) {
+      const maxIdx = a >= b ? 0 : 1;
+
+      // If outcomes are strings like ["Yes","No"], use them.
+      if (outcomes.length >= 2) {
+        const fromOutcomes = coerceYesNoUpper(outcomes[maxIdx]);
+        if (fromOutcomes) return fromOutcomes;
+      }
+
+      // Otherwise use a looser close threshold than 0.98/0.02 so Outcome populates sooner.
+      const max = Math.max(a, b);
+      const min = Math.min(a, b);
+      if (max >= 0.9 && min <= 0.1) return a > b ? "YES" : "NO";
+    }
+  }
+
+  return null;
+}
+
+// KV is optional (so your 1-minute mode works even if KV isn't configured)
 function kvKey(slug: string, tokenId: string) {
   return `pm:mid:${slug}:${tokenId}`;
 }
 
 async function loadMidpointsFromKv(tokenId: string, slug: string, startTsSec: number, endTsSec: number) {
-  const key = kvKey(slug, tokenId);
-  const obj = await kv.hgetall<Record<string, string>>(key);
-  if (!obj) return [];
+  try {
+    const mod = await import("@vercel/kv");
+    const kv = (mod as any).kv;
+    if (!kv) return [];
 
-  const out: Array<{ t: number; p: number }> = [];
-  for (const [k, v] of Object.entries(obj)) {
-    const t = Number(k);
-    const p = Number(v);
-    if (!Number.isFinite(t) || !Number.isFinite(p)) continue;
-    if (t < startTsSec || t > endTsSec) continue;
-    out.push({ t, p });
+    const key = kvKey(slug, tokenId);
+    const obj = (await kv.hgetall(key)) as Record<string, string> | null;
+    if (!obj) return [];
+
+    const out: Array<{ t: number; p: number }> = [];
+    for (const [k, v] of Object.entries(obj)) {
+      const t = Number(k);
+      const p = Number(v);
+      if (!Number.isFinite(t) || !Number.isFinite(p)) continue;
+      if (t < startTsSec || t > endTsSec) continue;
+      out.push({ t, p });
+    }
+    out.sort((a, b) => a.t - b.t);
+    return out;
+  } catch {
+    return [];
   }
-  out.sort((a, b) => a.t - b.t);
-  return out;
 }
 
 export async function GET(req: Request) {
@@ -124,10 +169,11 @@ export async function GET(req: Request) {
       threshold: searchParams.get("threshold") ?? undefined,
       fidelity: searchParams.get("fidelity") ?? undefined,
       graceSec: searchParams.get("graceSec") ?? undefined,
+      mode: searchParams.get("mode") ?? undefined,
     });
     if (!parsed.success) return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
 
-    const { marketBase, anchorStartTsSec, count, threshold, fidelity, graceSec } = parsed.data;
+    const { marketBase, anchorStartTsSec, count, threshold, fidelity, graceSec, mode } = parsed.data;
     const base = marketBase.trim().replace(/-+$/g, "");
 
     const rows: any[] = [];
@@ -139,21 +185,26 @@ export async function GET(req: Request) {
 
       try {
         const m = await fetchMarketBySlug(slug);
+
         const ids = normalizeStringOrArray(m?.clobTokenIds ?? m?.clobTokenIDs ?? m?.clob_token_ids);
         const yesId = ids?.[0] ? String(ids[0]) : null;
         const noId = ids?.[1] ? String(ids[1]) : null;
 
-        const outcomePrices = toNumArray(m?.outcomePrices);
-        const resolvedWinner = inferredWinnerFromOutcomePrices(outcomePrices, m?.closed);
+        const resolvedWinner = inferWinnerFromClosedMarket(m);
+        const outcomeKnown = resolvedWinner !== null;
 
         let yesHit = null;
         let noHit = null;
 
-        // Prefer per-second recorded midpoints if available (KV)
+        const shouldUseKv = mode !== "prices";
+        const shouldUsePrices = mode !== "kv";
+
         if (yesId) {
-          const kvHist = await loadMidpointsFromKv(yesId, slug, start, end);
-          if (kvHist.length) yesHit = firstHit(kvHist, threshold);
-          else {
+          if (shouldUseKv) {
+            const kvHist = await loadMidpointsFromKv(yesId, slug, start, end);
+            if (kvHist.length) yesHit = firstHit(kvHist, threshold);
+          }
+          if (!yesHit && shouldUsePrices) {
             const h = await fetchPricesHistory(yesId, start, end, fidelity);
             const hist = Array.isArray(h?.history) ? h.history : [];
             yesHit = firstHit(hist, threshold);
@@ -161,9 +212,11 @@ export async function GET(req: Request) {
         }
 
         if (noId) {
-          const kvHist = await loadMidpointsFromKv(noId, slug, start, end);
-          if (kvHist.length) noHit = firstHit(kvHist, threshold);
-          else {
+          if (shouldUseKv) {
+            const kvHist = await loadMidpointsFromKv(noId, slug, start, end);
+            if (kvHist.length) noHit = firstHit(kvHist, threshold);
+          }
+          if (!noHit && shouldUsePrices) {
             const h = await fetchPricesHistory(noId, start, end, fidelity);
             const hist = Array.isArray(h?.history) ? h.history : [];
             noHit = firstHit(hist, threshold);
@@ -171,13 +224,10 @@ export async function GET(req: Request) {
         }
 
         let first: null | { side: "YES" | "NO"; t: number; p: number } = null;
-        if (yesHit && noHit)
-          first =
-            yesHit.t <= noHit.t ? { side: "YES", t: yesHit.t, p: yesHit.p } : { side: "NO", t: noHit.t, p: noHit.p };
+        if (yesHit && noHit) first = yesHit.t <= noHit.t ? { side: "YES", t: yesHit.t, p: yesHit.p } : { side: "NO", t: noHit.t, p: noHit.p };
         else if (yesHit) first = { side: "YES", t: yesHit.t, p: yesHit.p };
         else if (noHit) first = { side: "NO", t: noHit.t, p: noHit.p };
 
-        const outcomeKnown = resolvedWinner !== null;
         const match = first && resolvedWinner ? first.side === resolvedWinner : null;
 
         rows.push({
@@ -185,7 +235,9 @@ export async function GET(req: Request) {
           startTsSec: start,
           endTsSec: start + 300,
           threshold,
-          firstHit: first, // t is epoch seconds
+          graceSec,
+          mode,
+          firstHit: first, // t in epoch seconds
           resolvedWinner,
           outcomeKnown,
           match,
@@ -209,6 +261,7 @@ export async function GET(req: Request) {
         threshold,
         fidelity,
         graceSec,
+        mode,
         totals: {
           hitCount: hits.length,
           knownOutcomeCount: withKnownOutcome.length,

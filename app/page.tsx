@@ -276,6 +276,9 @@ export default function Page() {
   const [ta, setTa] = useState<TAState | null>(null);
 
   const [marketEvents, setMarketEvents] = useState<MarketEvent[]>([]);
+  const [marketEvents1m, setMarketEvents1m] = useState<MarketEvent[]>([]);
+  const [eventLogStatus1m, setEventLogStatus1m] = useState<string>("Idle");
+  const [eventLogErr1m, setEventLogErr1m] = useState<string | null>(null);
   const [taAccuracyPct, setTaAccuracyPct] = useState<number>(0);
   const [taTotalSignals, setTaTotalSignals] = useState<number>(0);
   const [taPredRows, setTaPredRows] = useState<TaPredRow[]>([]);
@@ -367,26 +370,33 @@ export default function Page() {
 
     async function run() {
       setEventLogErr(null);
+      setEventLogErr1m(null);
 
       const base = marketBase.trim();
       const anchor = resolved?.startTsSec ?? null;
 
       if (!base || !anchor) {
         setEventLogStatus("Waiting for anchor...");
+        setEventLogStatus1m("Waiting for anchor...");
         return;
       }
 
       const fetchId = ++eventFetchIdRef.current;
       setEventLogStatus("Loading signals...");
+      setEventLogStatus1m("Loading 1m signals...");
 
       try {
-        const [hit80Res, taRes] = await Promise.all([
-          fetch(
-            `/api/poly-hit80?marketBase=${encodeURIComponent(base)}&anchorStartTsSec=${encodeURIComponent(
-              String(anchor)
-            )}&count=${encodeURIComponent(String(historySlugs))}&threshold=0.8&fidelity=1`,
-            { cache: "no-store" }
-          ),
+        const qsCommon =
+          `marketBase=${encodeURIComponent(base)}` +
+          `&anchorStartTsSec=${encodeURIComponent(String(anchor))}` +
+          `&count=${encodeURIComponent(String(historySlugs))}` +
+          `&threshold=0.8` +
+          `&fidelity=1` +
+          `&graceSec=180`;
+
+        const [hitAutoRes, hit1mRes, taRes] = await Promise.all([
+          fetch(`/api/poly-hit80?${qsCommon}&mode=auto`, { cache: "no-store" }),
+          fetch(`/api/poly-hit80?${qsCommon}&mode=prices`, { cache: "no-store" }),
           fetch(
             `/api/poly-ta-accuracy?marketBase=${encodeURIComponent(base)}&anchorStartTsSec=${encodeURIComponent(
               String(anchor)
@@ -395,42 +405,46 @@ export default function Page() {
           ),
         ]);
 
-        const hit80Json = await hit80Res.json().catch(() => null);
+        const hitAutoJson = await hitAutoRes.json().catch(() => null);
+        const hit1mJson = await hit1mRes.json().catch(() => null);
         const taJson = await taRes.json().catch(() => null);
 
-        if (!hit80Res.ok) throw new Error(`poly-hit80: ${errToText(hit80Json?.error ?? hit80Json)}`);
+        if (!hitAutoRes.ok) throw new Error(`poly-hit80(auto): ${errToText(hitAutoJson?.error ?? hitAutoJson)}`);
+        if (!hit1mRes.ok) throw new Error(`poly-hit80(1m): ${errToText(hit1mJson?.error ?? hit1mJson)}`);
         if (!taRes.ok) throw new Error(`poly-ta-accuracy: ${errToText(taJson?.error ?? taJson)}`);
 
-        const events = parseEventsFromHit80(hit80Json);
+        const eventsAuto = parseEventsFromHit80(hitAutoJson);
+        const events1m = parseEventsFromHit80(hit1mJson);
 
-        // Build outcome lookup from Event Log (this is what makes TA outcomes load)
+        // Build outcome lookup using BOTH (auto first, then 1m as fallback)
         const outcomesBySlug = new Map<string, "Yes" | "No">();
-        for (const e of events) {
+        for (const e of [...eventsAuto, ...events1m]) {
           if (e.outcome === "Yes" || e.outcome === "No") outcomesBySlug.set(e.slug, e.outcome);
         }
 
         const taRows = parseTaRowsToTable(taJson, outcomesBySlug);
-
-        // Compute correctness from TA rows (not from taJson summary fields)
         const TA_WINDOW = 30;
         const taComputed = computeTaCorrectnessFromRows(taRows, TA_WINDOW);
 
         if (!alive) return;
         if (fetchId !== eventFetchIdRef.current) return;
 
-        setMarketEvents(events);
-        setTaPredRows(taRows);
+        setMarketEvents(eventsAuto);
+        setMarketEvents1m(events1m);
 
+        setTaPredRows(taRows);
         setTaAccuracyPct(taComputed.accuracyPct);
         setTaTotalSignals(taComputed.totalSignals);
 
-        setEventLogStatus(
-          events.length ? "Idle" : `No events found (response keys: ${Object.keys(hit80Json ?? {}).join(", ")})`
-        );
+        setEventLogStatus(eventsAuto.length ? "Idle" : `No events found (auto)`);
+        setEventLogStatus1m(events1m.length ? "Idle" : `No events found (1m)`);
       } catch (e: any) {
         if (!alive) return;
-        setEventLogErr(errToText(e));
+        const msg = errToText(e);
+        setEventLogErr(msg);
+        setEventLogErr1m(msg);
         setEventLogStatus("Error");
+        setEventLogStatus1m("Error");
       }
     }
 
@@ -702,14 +716,47 @@ export default function Page() {
         </div>
 
         <div className={splitTables ? "grid gap-6 lg:grid-cols-2 items-start" : "grid gap-6"}>
-          <TaAnalysisTable
-            events={marketEvents}
-            taAccuracy={taAccuracyPct}
-            totalSignals={taTotalSignals}
-            onEventClick={setSelectedEvent}
-          />
+          <div className="grid gap-6">
+            <div>
+              <div className="px-1 text-sm font-medium text-zinc-800 dark:text-zinc-200">
+                Event Log (hi-res / recorded, fallback to minute)
+              </div>
+              <div className="px-1 mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+                {eventLogStatus}
+                {eventLogErr ? <span className="ml-2 text-rose-600">Error: {eventLogErr}</span> : null}
+              </div>
+              <div className="mt-2">
+                <TaAnalysisTable
+                  events={marketEvents}
+                  taAccuracy={taAccuracyPct}
+                  totalSignals={taTotalSignals}
+                  onEventClick={setSelectedEvent}
+                />
+              </div>
+            </div>
+
+            <div>
+              <div className="px-1 text-sm font-medium text-zinc-800 dark:text-zinc-200">
+                Event Log (1 minute data)
+              </div>
+              <div className="px-1 mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+                {eventLogStatus1m}
+                {eventLogErr1m ? <span className="ml-2 text-rose-600">Error: {eventLogErr1m}</span> : null}
+              </div>
+              <div className="mt-2">
+                <TaAnalysisTable
+                  events={marketEvents1m}
+                  taAccuracy={taAccuracyPct}
+                  totalSignals={taTotalSignals}
+                  onEventClick={setSelectedEvent}
+                />
+              </div>
+            </div>
+          </div>
+
           <TaPredictionTable rows={taPredRows} />
         </div>
+
       </section>
 
       <section className="overflow-hidden rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800">
