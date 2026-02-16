@@ -11,13 +11,8 @@ const Q = z.object({
   threshold: z.coerce.number().min(0.5).max(0.99).default(0.8),
   fidelity: z.coerce.number().int().min(1).max(5).default(1),
 
-  // NEW: extend the time window to catch hits shortly after the 5m bucket ends
   graceSec: z.coerce.number().int().min(0).max(600).default(180),
 
-  // NEW:
-  // - auto: prefer KV (hi-res) if available, else fallback to prices-history (minute)
-  // - prices: force prices-history only (minute)
-  // - kv: KV only (hi-res); if missing, firstHit will be null
   mode: z.enum(["auto", "prices", "kv"]).default("auto"),
 });
 
@@ -91,7 +86,6 @@ function coerceYesNoUpper(x: any): "YES" | "NO" | null {
 }
 
 function inferWinnerFromClosedMarket(m: any): "YES" | "NO" | null {
-  // Prefer explicit fields if they exist (varies by upstream).
   const explicit =
     coerceYesNoUpper(m?.resolvedWinner) ??
     coerceYesNoUpper(m?.resolvedOutcome) ??
@@ -100,8 +94,6 @@ function inferWinnerFromClosedMarket(m: any): "YES" | "NO" | null {
     null;
 
   if (explicit) return explicit;
-
-  // Fall back to outcomePrices/outcomes when closed.
   if (!m?.closed) return null;
 
   const outcomePrices = toNumArray(m?.outcomePrices);
@@ -113,13 +105,11 @@ function inferWinnerFromClosedMarket(m: any): "YES" | "NO" | null {
     if (Number.isFinite(a) && Number.isFinite(b)) {
       const maxIdx = a >= b ? 0 : 1;
 
-      // If outcomes are strings like ["Yes","No"], use them.
       if (outcomes.length >= 2) {
         const fromOutcomes = coerceYesNoUpper(outcomes[maxIdx]);
         if (fromOutcomes) return fromOutcomes;
       }
 
-      // Otherwise use a looser close threshold than 0.98/0.02 so Outcome populates sooner.
       const max = Math.max(a, b);
       const min = Math.min(a, b);
       if (max >= 0.9 && min <= 0.1) return a > b ? "YES" : "NO";
@@ -129,7 +119,7 @@ function inferWinnerFromClosedMarket(m: any): "YES" | "NO" | null {
   return null;
 }
 
-// KV is optional (so your 1-minute mode works even if KV isn't configured)
+// KV optional
 function kvKey(slug: string, tokenId: string) {
   return `pm:mid:${slug}:${tokenId}`;
 }
@@ -193,8 +183,14 @@ export async function GET(req: Request) {
         const resolvedWinner = inferWinnerFromClosedMarket(m);
         const outcomeKnown = resolvedWinner !== null;
 
-        let yesHit = null;
-        let noHit = null;
+        let yesHit: any = null;
+        let noHit: any = null;
+
+        // NEW: source/debug fields
+        let yesSource: "kv" | "prices" | null = null;
+        let noSource: "kv" | "prices" | null = null;
+        let yesSamples = 0;
+        let noSamples = 0;
 
         const shouldUseKv = mode !== "prices";
         const shouldUsePrices = mode !== "kv";
@@ -202,11 +198,17 @@ export async function GET(req: Request) {
         if (yesId) {
           if (shouldUseKv) {
             const kvHist = await loadMidpointsFromKv(yesId, slug, start, end);
-            if (kvHist.length) yesHit = firstHit(kvHist, threshold);
+            yesSamples = kvHist.length;
+            if (kvHist.length) {
+              yesSource = "kv";
+              yesHit = firstHit(kvHist, threshold);
+            }
           }
           if (!yesHit && shouldUsePrices) {
             const h = await fetchPricesHistory(yesId, start, end, fidelity);
             const hist = Array.isArray(h?.history) ? h.history : [];
+            yesSamples = Math.max(yesSamples, hist.length);
+            yesSource = yesSource ?? "prices";
             yesHit = firstHit(hist, threshold);
           }
         }
@@ -214,11 +216,17 @@ export async function GET(req: Request) {
         if (noId) {
           if (shouldUseKv) {
             const kvHist = await loadMidpointsFromKv(noId, slug, start, end);
-            if (kvHist.length) noHit = firstHit(kvHist, threshold);
+            noSamples = kvHist.length;
+            if (kvHist.length) {
+              noSource = "kv";
+              noHit = firstHit(kvHist, threshold);
+            }
           }
           if (!noHit && shouldUsePrices) {
             const h = await fetchPricesHistory(noId, start, end, fidelity);
             const hist = Array.isArray(h?.history) ? h.history : [];
+            noSamples = Math.max(noSamples, hist.length);
+            noSource = noSource ?? "prices";
             noHit = firstHit(hist, threshold);
           }
         }
@@ -227,6 +235,10 @@ export async function GET(req: Request) {
         if (yesHit && noHit) first = yesHit.t <= noHit.t ? { side: "YES", t: yesHit.t, p: yesHit.p } : { side: "NO", t: noHit.t, p: noHit.p };
         else if (yesHit) first = { side: "YES", t: yesHit.t, p: yesHit.p };
         else if (noHit) first = { side: "NO", t: noHit.t, p: noHit.p };
+
+        let firstHitSource: "kv" | "prices" | null = null;
+        if (first?.side === "YES") firstHitSource = yesSource;
+        if (first?.side === "NO") firstHitSource = noSource;
 
         const match = first && resolvedWinner ? first.side === resolvedWinner : null;
 
@@ -237,7 +249,12 @@ export async function GET(req: Request) {
           threshold,
           graceSec,
           mode,
-          firstHit: first, // t in epoch seconds
+          firstHit: first,
+          firstHitSource, // NEW
+          yesSource, // NEW
+          noSource, // NEW
+          yesSamples, // NEW
+          noSamples, // NEW
           resolvedWinner,
           outcomeKnown,
           match,

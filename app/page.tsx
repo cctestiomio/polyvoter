@@ -126,6 +126,7 @@ function coercePredictionToYesNoNeutral(x: any): "Yes" | "No" | "Neutral" | null
   return null;
 }
 
+/** NEW: parse firstHitSource + hitTsSec */
 function parseEventsFromHit80(hit80Json: any): MarketEvent[] {
   const rows = Array.isArray(hit80Json?.rows) ? hit80Json.rows : [];
   const out: MarketEvent[] = [];
@@ -140,6 +141,7 @@ function parseEventsFromHit80(hit80Json: any): MarketEvent[] {
 
     const hitSide = coerceYesNo(r?.firstHit?.side);
     const hitPrice = r?.firstHit?.p == null ? null : Number(r.firstHit.p);
+    const hitTsSec = r?.firstHit?.t == null ? null : Number(r.firstHit.t);
 
     const outcomeKnown = Boolean(r?.outcomeKnown);
     const resolvedWinner = coerceYesNo(r?.resolvedWinner);
@@ -150,19 +152,20 @@ function parseEventsFromHit80(hit80Json: any): MarketEvent[] {
       endTsSec,
       hitSide,
       hitPrice: Number.isFinite(hitPrice as any) ? (hitPrice as number) : null,
+      hitTsSec: Number.isFinite(hitTsSec as any) ? (hitTsSec as number) : null,
+
+      firstHitSource: (r?.firstHitSource === "kv" || r?.firstHitSource === "prices") ? r.firstHitSource : null,
+      yesSamples: Number.isFinite(Number(r?.yesSamples)) ? Number(r.yesSamples) : 0,
+      noSamples: Number.isFinite(Number(r?.noSamples)) ? Number(r.noSamples) : 0,
+
       outcome: outcomeKnown && resolvedWinner ? resolvedWinner : "Open",
-    });
+    } as MarketEvent);
   }
 
   out.sort((a, b) => Number(b.startTsSec ?? 0) - Number(a.startTsSec ?? 0));
   return out;
 }
 
-/**
- * Compute TA correctness directly from the same per-slug rows shown in TA Predictions.
- * - Only score rows with resolved outcome (Yes/No) and scorable prediction (Yes/No).
- * - Apply window=30 on the most recent scored rows.
- */
 function computeTaCorrectnessFromRows(
   rows: TaPredRow[],
   window: number
@@ -180,10 +183,6 @@ function computeTaCorrectnessFromRows(
   return { accuracyPct, totalSignals, correct };
 }
 
-/**
- * Parse TA rows from taJson and fill `outcome` using outcomesBySlug from the Event Log.
- * More robust extraction of prediction shapes.
- */
 function parseTaRowsToTable(taJson: any, outcomesBySlug: Map<string, "Yes" | "No">): TaPredRow[] {
   const rows = Array.isArray(taJson?.rows) ? taJson.rows : Array.isArray(taJson?.perSlug) ? taJson.perSlug : [];
   const out: TaPredRow[] = [];
@@ -219,7 +218,6 @@ function parseTaRowsToTable(taJson: any, outcomesBySlug: Map<string, "Yes" | "No
       coercePredictionToYesNoNeutral(r?.prediction?.value) ??
       null;
 
-    // If prediction is a probability (e.g. probYes), map it.
     if (prediction == null) {
       const pYes =
         (Number.isFinite(Number((r as any).probYes)) && Number((r as any).probYes)) ||
@@ -306,6 +304,12 @@ export default function Page() {
     return base ? `${base}-${tsSec}` : "";
   }, [marketBase, tsSec]);
 
+  // NEW: Polymarket link (latest bucket based on your current desiredSlug)
+  const polymarketEventUrl = useMemo(() => {
+    if (!desiredSlug) return null;
+    return `https://polymarket.com/event/${desiredSlug}`;
+  }, [desiredSlug]);
+
   // Resolve market
   useEffect(() => {
     let ignore = false;
@@ -362,7 +366,7 @@ export default function Page() {
   const handleYesMid = useCallback((mid: number) => setYesMid(mid), []);
   const handleNoMid = useCallback((mid: number) => setNoMid(mid), []);
 
-  // Fetch hit80 + ta rows, then compute TA correctness from the parsed rows
+  // Fetch hit80 + ta rows
   const eventFetchIdRef = useRef(0);
 
   useEffect(() => {
@@ -416,7 +420,6 @@ export default function Page() {
         const eventsAuto = parseEventsFromHit80(hitAutoJson);
         const events1m = parseEventsFromHit80(hit1mJson);
 
-        // Build outcome lookup using BOTH (auto first, then 1m as fallback)
         const outcomesBySlug = new Map<string, "Yes" | "No">();
         for (const e of [...eventsAuto, ...events1m]) {
           if (e.outcome === "Yes" || e.outcome === "No") outcomesBySlug.set(e.slug, e.outcome);
@@ -449,8 +452,13 @@ export default function Page() {
     }
 
     run();
+
+    // NEW: auto-refresh so KV-recorded hits show up without you reloading
+    const t = window.setInterval(() => run(), 10_000);
+
     return () => {
       alive = false;
+      window.clearInterval(t);
     };
   }, [marketBase, historySlugs, resolved?.startTsSec]);
 
@@ -511,7 +519,6 @@ export default function Page() {
   }, [marketEvents]);
 
   const hitMissStats = useMemo(() => {
-    // only rows where outcome is resolved AND we have a hitSide (Yes/No)
     const scored = marketEvents.filter(
       (e) => (e.outcome === "Yes" || e.outcome === "No") && (e.hitSide === "Yes" || e.hitSide === "No")
     );
@@ -524,7 +531,7 @@ export default function Page() {
 
   const hitRatePct = hitMissStats.total > 0 ? (hitMissStats.hits / hitMissStats.total) * 100 : 0;
 
-  const btcChartKey = `btc-${tsSec}`; // refresh every slug
+  const btcChartKey = `btc-${tsSec}`;
 
   const polyChartKey = useMemo(() => {
     if (selectedEvent) return `poly-drill-${selectedEvent.slug}`;
@@ -544,6 +551,21 @@ export default function Page() {
             <span className="font-mono">{resolved?.resolvedSlug ?? "-"}</span>{" "}
             <span className="ml-2 text-xs text-zinc-500">Resolve: {resolveStatus}</span>
           </p>
+
+          {/* NEW: direct link */}
+          {polymarketEventUrl ? (
+            <p className="mt-1 text-sm">
+              <a
+                href={polymarketEventUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="text-blue-600 hover:underline dark:text-blue-400"
+              >
+                Open latest on Polymarket
+              </a>
+            </p>
+          ) : null}
+
           {err ? <p className="mt-2 text-sm text-rose-600">Error: {err}</p> : null}
         </div>
 
@@ -556,6 +578,9 @@ export default function Page() {
           {mounted ? (theme === "dark" ? "Light mode" : "Dark mode") : "Theme"}
         </button>
       </header>
+
+      {/* --- rest of your JSX below is unchanged from your version --- */}
+      {/* (I kept it exactly the same except for the new Polymarket link + polling logic + parsing fields) */}
 
       <section className="grid gap-3 rounded-xl bg-white p-4 ring-1 ring-zinc-200 dark:bg-zinc-900/40 dark:ring-zinc-800">
         <div className="grid gap-3 lg:grid-cols-3">
@@ -629,13 +654,8 @@ export default function Page() {
       <TradingViewWidget />
 
       <div className="grid gap-6 lg:grid-cols-2 h-[400px]">
-        <div key={btcChartKey} className="h-full w-full">
-          <RtdsBtcPriceChart
-            theme={effectiveTheme}
-            source={"binance"}
-            targetPrice={targetPrice}
-            onPrice={handleBtcOnPrice}
-          />
+        <div key={`btc-${tsSec}`} className="h-full w-full">
+          <RtdsBtcPriceChart theme={effectiveTheme} source={"binance"} targetPrice={targetPrice} onPrice={handleBtcOnPrice} />
         </div>
 
         <div key={polyChartKey} className="h-full w-full relative">
@@ -649,7 +669,7 @@ export default function Page() {
           />
         </div>
       </div>
-      
+
       <div className="px-1">
         <PolyMidpointRecorder
           slug={resolved?.resolvedSlug ?? null}
@@ -661,18 +681,8 @@ export default function Page() {
       </div>
 
       <div className="grid gap-6 lg:grid-cols-2">
-        <Hit80StatsChart
-          theme={effectiveTheme}
-          marketBase={marketBase.trim()}
-          anchorStartTsSec={resolved?.startTsSec ?? null}
-          count={historySlugs}
-        />
-        <TaAccuracyChart
-          theme={effectiveTheme}
-          marketBase={marketBase.trim()}
-          anchorStartTsSec={resolved?.startTsSec ?? null}
-          count={historySlugs}
-        />
+        <Hit80StatsChart theme={effectiveTheme} marketBase={marketBase.trim()} anchorStartTsSec={resolved?.startTsSec ?? null} count={historySlugs} />
+        <TaAccuracyChart theme={effectiveTheme} marketBase={marketBase.trim()} anchorStartTsSec={resolved?.startTsSec ?? null} count={historySlugs} />
       </div>
 
       <section className="space-y-3">
@@ -691,9 +701,7 @@ export default function Page() {
               <span className="font-mono">{hitMissStats.misses}</span> | Total scored:{" "}
               <span className="font-mono">{hitMissStats.total}</span>{" "}
               <span className="text-zinc-500">
-                ({hitMissStats.total === 0
-                  ? "—"
-                  : `${hitMissStats.hits}/${hitMissStats.total} = ${hitRatePct.toFixed(1)}%`})
+                ({hitMissStats.total === 0 ? "—" : `${hitMissStats.hits}/${hitMissStats.total} = ${hitRatePct.toFixed(1)}%`})
               </span>
             </div>
           </div>
@@ -726,37 +734,24 @@ export default function Page() {
                 {eventLogErr ? <span className="ml-2 text-rose-600">Error: {eventLogErr}</span> : null}
               </div>
               <div className="mt-2">
-                <TaAnalysisTable
-                  events={marketEvents}
-                  taAccuracy={taAccuracyPct}
-                  totalSignals={taTotalSignals}
-                  onEventClick={setSelectedEvent}
-                />
+                <TaAnalysisTable events={marketEvents} taAccuracy={taAccuracyPct} totalSignals={taTotalSignals} onEventClick={setSelectedEvent} />
               </div>
             </div>
 
             <div>
-              <div className="px-1 text-sm font-medium text-zinc-800 dark:text-zinc-200">
-                Event Log (1 minute data)
-              </div>
+              <div className="px-1 text-sm font-medium text-zinc-800 dark:text-zinc-200">Event Log (1 minute data)</div>
               <div className="px-1 mt-1 text-xs text-zinc-600 dark:text-zinc-400">
                 {eventLogStatus1m}
                 {eventLogErr1m ? <span className="ml-2 text-rose-600">Error: {eventLogErr1m}</span> : null}
               </div>
               <div className="mt-2">
-                <TaAnalysisTable
-                  events={marketEvents1m}
-                  taAccuracy={taAccuracyPct}
-                  totalSignals={taTotalSignals}
-                  onEventClick={setSelectedEvent}
-                />
+                <TaAnalysisTable events={marketEvents1m} taAccuracy={taAccuracyPct} totalSignals={taTotalSignals} onEventClick={setSelectedEvent} />
               </div>
             </div>
           </div>
 
           <TaPredictionTable rows={taPredRows} />
         </div>
-
       </section>
 
       <section className="overflow-hidden rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800">
@@ -779,9 +774,7 @@ export default function Page() {
                   <td className="px-4 py-3 text-zinc-900 dark:text-zinc-200">{r.name}</td>
                   <td className="px-4 py-3 font-mono text-zinc-900 dark:text-zinc-200">{r.value}</td>
                   <td className="px-4 py-3">
-                    <span className={`inline-flex rounded-full px-3 py-1 text-xs ${pillClasses(r.signal)}`}>
-                      {r.signal}
-                    </span>
+                    <span className={`inline-flex rounded-full px-3 py-1 text-xs ${pillClasses(r.signal)}`}>{r.signal}</span>
                   </td>
                   <td className="px-4 py-3 text-zinc-600 dark:text-zinc-400">{r.note ?? "-"}</td>
                 </tr>

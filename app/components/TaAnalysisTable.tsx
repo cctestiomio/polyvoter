@@ -1,93 +1,75 @@
 "use client";
 
+import React from "react";
+
 export type MarketEvent = {
   slug: string;
-
-  // Preferred (from poly-hit80 rows)
-  startTsSec?: number; // seconds
-  endTsSec?: number;   // seconds
-
-  // Legacy fallback (if some code still sets this)
-  ts?: number; // ms epoch
+  startTsSec: number;
+  endTsSec: number;
 
   hitSide: "Yes" | "No" | null;
   hitPrice: number | null;
 
-  outcome: "Open" | "Yes" | "No";
+  // NEW: exact second when hit occurred (epoch sec)
+  hitTsSec?: number | null;
+
+  // NEW: show source
+  firstHitSource?: "kv" | "prices" | null;
+  yesSamples?: number;
+  noSamples?: number;
+
+  outcome: "Yes" | "No" | "Open";
 };
 
-function yesNoPillClasses(side: "Yes" | "No" | null) {
-  if (side === "Yes") return "bg-emerald-500/15 text-emerald-700 ring-1 ring-emerald-500/30 dark:text-emerald-300";
-  if (side === "No") return "bg-rose-500/15 text-rose-700 ring-1 ring-rose-500/30 dark:text-rose-300";
-  return "bg-zinc-500/15 text-zinc-700 ring-1 ring-zinc-500/30 dark:text-zinc-300";
-}
-
-function outcomePillClasses(outcome: MarketEvent["outcome"]) {
-  if (outcome === "Yes") return yesNoPillClasses("Yes");
-  if (outcome === "No") return yesNoPillClasses("No");
-  return "bg-zinc-500/10 text-zinc-600 ring-1 ring-zinc-500/20 dark:text-zinc-400";
-}
-
-function toFiniteNumber(x: any): number | null {
-  const n = typeof x === "number" ? x : Number(x);
-  return Number.isFinite(n) ? n : null;
-}
-
-function normalizeWindow(e: MarketEvent): { startSec: number | null; endSec: number | null } {
-  const startFromField = toFiniteNumber(e.startTsSec);
-  const endFromField = toFiniteNumber(e.endTsSec);
-
-  if (startFromField != null) {
-    const end = endFromField ?? (startFromField + 300);
-    return { startSec: startFromField, endSec: end };
-  }
-
-  const tsMs = toFiniteNumber(e.ts);
-  if (tsMs != null) {
-    const startSec = Math.floor(tsMs / 1000);
-    return { startSec, endSec: startSec + 300 };
-  }
-
-  return { startSec: null, endSec: null };
-}
-
-const fmtEt = new Intl.DateTimeFormat("en-US", {
-  timeZone: "America/New_York",
-  hour: "numeric",
-  minute: "2-digit",
-  hour12: true,
-});
-
-function fmtEtHmSafe(tsSec: number): string | null {
-  const d = new Date(tsSec * 1000);
-  // Hard guard: never let Intl format an invalid Date
-  if (!Number.isFinite(d.getTime())) return null;
-  return fmtEt.format(d);
-}
-
-function fmtEtRangeSafe(startTsSec: number, endTsSec: number) {
-  const a = fmtEtHmSafe(startTsSec);
-  const b = fmtEtHmSafe(endTsSec);
-  if (!a || !b) return "—";
+function fmtETRange(startTsSec: number, endTsSec: number) {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+  const a = fmt.format(new Date(startTsSec * 1000));
+  const b = fmt.format(new Date(endTsSec * 1000));
   return `${a}–${b} ET`;
 }
 
-export default function TaAnalysisTable(props: {
+function fmtETTime(tsSec: number) {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  return fmt.format(new Date(tsSec * 1000));
+}
+
+function badge(sig: "Yes" | "No") {
+  return sig === "Yes"
+    ? "bg-emerald-500/15 text-emerald-700 ring-1 ring-emerald-500/30 dark:text-emerald-300"
+    : "bg-rose-500/15 text-rose-700 ring-1 ring-rose-500/30 dark:text-rose-300";
+}
+
+export default function TaAnalysisTable({
+  events,
+  taAccuracy,
+  totalSignals,
+  onEventClick,
+}: {
   events: MarketEvent[];
   taAccuracy: number;
   totalSignals: number;
   onEventClick?: (ev: MarketEvent) => void;
 }) {
-  const { events, onEventClick } = props;
-
   return (
-    <section className="overflow-hidden rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800">
-      <div className="bg-white px-4 py-3 text-sm font-medium text-zinc-800 dark:bg-zinc-900/40 dark:text-zinc-200">
-        Event Log <span className="ml-2 text-xs font-normal text-zinc-500">Last {events.length} events</span>
+    <div className="overflow-hidden rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800">
+      <div className="bg-white px-4 py-3 text-sm font-medium text-zinc-800 dark:bg-zinc-900/40 dark:text-zinc-200 flex items-center justify-between">
+        <span>Event Log</span>
+        <span className="text-xs text-zinc-500">
+          TA: {taAccuracy.toFixed(1)}% ({totalSignals})
+        </span>
       </div>
 
       <div className="overflow-x-auto bg-white dark:bg-zinc-950">
-        <table className="w-full min-w-[980px] text-left text-sm">
+        <table className="w-full min-w-[900px] text-left text-sm">
           <thead className="bg-zinc-50 text-zinc-600 dark:bg-zinc-950 dark:text-zinc-400">
             <tr className="border-b border-zinc-200 dark:border-zinc-900">
               <th className="px-4 py-3">Slug window (ET)</th>
@@ -99,68 +81,86 @@ export default function TaAnalysisTable(props: {
           </thead>
 
           <tbody>
-            {events.length === 0 ? (
-              <tr>
-                <td className="px-4 py-6 text-zinc-500" colSpan={5}>
-                  No signals recorded yet.
-                </td>
-              </tr>
-            ) : null}
-
             {events.map((e) => {
-              const { startSec, endSec } = normalizeWindow(e);
-              const windowLabel =
-                startSec != null && endSec != null ? fmtEtRangeSafe(startSec, endSec) : "—";
-
               const resolved = e.outcome === "Yes" || e.outcome === "No";
-              const hasSignal = e.hitSide === "Yes" || e.hitSide === "No";
-              const isHit = resolved && hasSignal ? e.hitSide === e.outcome : null;
+              const scorable = e.hitSide === "Yes" || e.hitSide === "No";
+              const isHit = resolved && scorable && e.hitSide === e.outcome;
+              const isMiss = resolved && scorable && e.hitSide !== e.outcome;
 
               return (
                 <tr
-                  key={`${e.slug}-${startSec ?? e.ts ?? "x"}`}
-                  className="border-b border-zinc-200/70 dark:border-zinc-900/70 hover:bg-zinc-50/70 dark:hover:bg-zinc-900/30 cursor-pointer"
+                  key={e.slug}
+                  className="border-b border-zinc-200/70 dark:border-zinc-900/70 hover:bg-zinc-50/60 dark:hover:bg-zinc-900/20 cursor-pointer"
                   onClick={() => onEventClick?.(e)}
-                  title="Click to drill into this slug"
                 >
-                  <td className="px-4 py-3 font-mono text-zinc-900 dark:text-zinc-200">
-                    {windowLabel}
+                  <td className="px-4 py-3 text-zinc-900 dark:text-zinc-200">
+                    {fmtETRange(e.startTsSec, e.endTsSec)}
                   </td>
 
+                  {/* Signal cell + KV/1m badge */}
                   <td className="px-4 py-3">
-                    <span className={`inline-flex rounded-full px-3 py-1 text-xs ${yesNoPillClasses(e.hitSide)}`}>
-                      {e.hitSide ?? "—"}
-                    </span>
-                    {Number.isFinite(e.hitPrice as any) ? (
-                      <span className="ml-2 font-mono text-xs text-zinc-500">{(e.hitPrice as number).toFixed(3)}</span>
-                    ) : null}
-                  </td>
+                    {e.hitSide ? (
+                      <div className="flex items-center gap-2">
+                        <span className={`inline-flex rounded-full px-3 py-1 text-xs ${badge(e.hitSide)}`}>
+                          {e.hitSide}
+                        </span>
 
-                  <td className="px-4 py-3">
-                    <span className={`inline-flex rounded-full px-3 py-1 text-xs ${outcomePillClasses(e.outcome)}`}>
-                      {e.outcome === "Open" ? "Pending..." : e.outcome}
-                    </span>
-                  </td>
+                        <span className="font-mono text-xs text-zinc-800 dark:text-zinc-200">
+                          {e.hitPrice == null ? "-" : e.hitPrice.toFixed(3)}
+                        </span>
 
-                  <td className="px-4 py-3">
-                    {isHit === null ? (
-                      <span className="text-zinc-500">—</span>
-                    ) : isHit ? (
-                      <span className="text-emerald-600 dark:text-emerald-400 font-medium">✓ Hit</span>
+                        {typeof e.hitTsSec === "number" ? (
+                          <span className="text-xs text-zinc-500">{fmtETTime(e.hitTsSec)}</span>
+                        ) : null}
+
+                        {e.firstHitSource ? (
+                          <span className="rounded-md px-1.5 py-0.5 text-[10px] ring-1 ring-zinc-200 text-zinc-600 dark:ring-zinc-800 dark:text-zinc-300">
+                            {e.firstHitSource === "kv" ? "KV" : "1m"}
+                          </span>
+                        ) : null}
+                      </div>
                     ) : (
-                      <span className="text-rose-600 dark:text-rose-400 font-medium">✗ Miss</span>
+                      <span className="text-zinc-400">—</span>
                     )}
                   </td>
 
-                  <td className="px-4 py-3 font-mono text-xs text-zinc-600 dark:text-zinc-400">
-                    {e.slug}
+                  <td className="px-4 py-3">
+                    {resolved ? (
+                      <span className={`inline-flex rounded-full px-3 py-1 text-xs ${badge(e.outcome)}`}>
+                        {e.outcome}
+                      </span>
+                    ) : (
+                      <span className="inline-flex rounded-full px-3 py-1 text-xs bg-zinc-500/10 text-zinc-600 ring-1 ring-zinc-500/20 dark:text-zinc-300">
+                        Pending…
+                      </span>
+                    )}
                   </td>
+
+                  <td className="px-4 py-3">
+                    {isHit ? (
+                      <span className="text-emerald-700 dark:text-emerald-300">✓ Hit</span>
+                    ) : isMiss ? (
+                      <span className="text-rose-700 dark:text-rose-300">✕ Miss</span>
+                    ) : (
+                      <span className="text-zinc-400">—</span>
+                    )}
+                  </td>
+
+                  <td className="px-4 py-3 font-mono text-xs text-zinc-700 dark:text-zinc-300">{e.slug}</td>
                 </tr>
               );
             })}
+
+            {events.length === 0 ? (
+              <tr>
+                <td colSpan={5} className="px-4 py-6 text-zinc-500">
+                  No events yet.
+                </td>
+              </tr>
+            ) : null}
           </tbody>
         </table>
       </div>
-    </section>
+    </div>
   );
 }
