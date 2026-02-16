@@ -6,7 +6,6 @@ import {
   ColorType,
   ISeriesApi,
   IChartApi,
-  LineData,
   UTCTimestamp,
   LogicalRange,
 } from "lightweight-charts";
@@ -20,19 +19,31 @@ type Props = {
   onNoMid?: (mid: number) => void;
 };
 
-// Helper: Fetch history safely
-async function fetchTokenHistory(tokenId: string, startTs: number, endTs: number) {
+type HistPoint = { t: number; p: number };
+type Pt = { time: UTCTimestamp; value: number };
+
+async function fetchTokenHistory(tokenId: string, startTs: number, endTs: number): Promise<HistPoint[]> {
   try {
-    // Try our internal proxy first to avoid CORS
     const res = await fetch(
-      `/api/poly-history?tokenId=${tokenId}&startTs=${startTs}&endTs=${endTs}`
+      `/api/poly-history?tokenId=${encodeURIComponent(tokenId)}&startTs=${encodeURIComponent(
+        String(startTs)
+      )}&endTs=${encodeURIComponent(String(endTs))}&t=${Date.now()}`,
+      { cache: "no-store" }
     );
     if (!res.ok) return [];
-    const json = await res.json();
-    return json.history || [];
+    const json: any = await res.json().catch(() => null);
+    return Array.isArray(json?.history) ? (json.history as HistPoint[]) : [];
   } catch {
     return [];
   }
+}
+
+function toPts(hist: HistPoint[]): Pt[] {
+  return hist
+    .map((p) => ({ time: Number(p.t) as UTCTimestamp, value: Number(p.p) }))
+    .filter((x) => Number.isFinite(x.time) && Number.isFinite(x.value))
+    .sort((a, b) => a.time - b.time)
+    .filter((v, i, a) => i === 0 || v.time !== a[i - 1].time); // Dedupe
 }
 
 export default function PolyLiveChart({
@@ -48,12 +59,10 @@ export default function PolyLiveChart({
   const yesSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   const noSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
 
-  // Connection guard & Reconnect refs
   const eventSourceRef = useRef<EventSource | null>(null);
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isUnmountedRef = useRef(false);
-  
-  // Track if we have set the initial 5m range
+
   const hasFittedRef = useRef(false);
 
   const [status, setStatus] = useState("Idle");
@@ -72,28 +81,22 @@ export default function PolyLiveChart({
     };
   }, [theme]);
 
-  // 1. Initialize Chart (EXACTLY as you provided)
+  // 1) Initialize chart
   useEffect(() => {
     if (!elRef.current) return;
 
     const chart = createChart(elRef.current, {
       width: elRef.current.clientWidth || 800,
       height: 300,
-      layout: {
-        background: { type: ColorType.Solid, color: colors.bg },
-        textColor: colors.text,
-      },
-      grid: {
-        vertLines: { color: colors.grid },
-        horzLines: { color: colors.grid },
-      },
+      layout: { background: { type: ColorType.Solid, color: colors.bg }, textColor: colors.text },
+      grid: { vertLines: { color: colors.grid }, horzLines: { color: colors.grid } },
       rightPriceScale: { borderVisible: false },
       timeScale: {
         borderVisible: false,
         timeVisible: true,
         secondsVisible: true,
-        shiftVisibleRangeOnNewBar: true, // Smooth scrolling enabled
-        rightOffset: 20, // Small buffer
+        shiftVisibleRangeOnNewBar: true,
+        rightOffset: 20,
       },
     });
 
@@ -120,6 +123,7 @@ export default function PolyLiveChart({
         chartRef.current.applyOptions({ width: elRef.current.clientWidth });
       }
     });
+
     ro.observe(elRef.current);
 
     return () => {
@@ -132,22 +136,28 @@ export default function PolyLiveChart({
     };
   }, [colors]);
 
-  // 2. Robust Connection Logic (Backfill + Reconnect + Stream)
-  const connect = async () => {
-    if (isUnmountedRef.current || !yesTokenId || !noTokenId) return;
-
-    // Cleanup any existing connection before starting new one
+  const closeStream = () => {
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
       eventSourceRef.current = null;
     }
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+  };
+
+  // 2) Backfill + stream
+  const connect = async () => {
+    if (isUnmountedRef.current || !yesTokenId || !noTokenId) return;
+
+    closeStream();
 
     setStatus("Loading history...");
 
-    // --- A. BACKFILL HISTORY (New Robust Logic) ---
     try {
       const nowSec = Math.floor(Date.now() / 1000);
-      const startSec = nowSec - 21600; // Fetch last 6 hours to be safe
+      const startSec = nowSec - 21600;
 
       const [yesHist, noHist] = await Promise.all([
         fetchTokenHistory(yesTokenId, startSec, nowSec),
@@ -156,60 +166,42 @@ export default function PolyLiveChart({
 
       if (isUnmountedRef.current) return;
 
-      // Populate YES Series
-      if (yesSeriesRef.current && yesHist.length > 0) {
-        const data = yesHist
-          .map((p: any) => ({ time: Number(p.t) as UTCTimestamp, value: Number(p.p) }))
-          .sort((a: LineData, b: LineData) => Number(a.time) - Number(b.time))
-          .filter((v, i, a) => i === 0 || v.time !== a[i - 1].time); // Dedupe
+      if (yesSeriesRef.current) {
+        const data = toPts(yesHist);
         yesSeriesRef.current.setData(data);
-        
-        if (data.length > 0) {
-            const val = data[data.length - 1].value;
-            setYesMid(val);
-            onYesMid?.(val);
+        if (data.length) {
+          const val = data[data.length - 1].value;
+          setYesMid(val);
+          onYesMid?.(val);
         }
       }
 
-      // Populate NO Series
-      if (noSeriesRef.current && noHist.length > 0) {
-        const data = noHist
-          .map((p: any) => ({ time: Number(p.t) as UTCTimestamp, value: Number(p.p) }))
-          .sort((a: LineData, b: LineData) => Number(a.time) - Number(b.time))
-          .filter((v, i, a) => i === 0 || v.time !== a[i - 1].time); // Dedupe
+      if (noSeriesRef.current) {
+        const data = toPts(noHist);
         noSeriesRef.current.setData(data);
-
-        if (data.length > 0) {
-            const val = data[data.length - 1].value;
-            setNoMid(val);
-            onNoMid?.(val);
+        if (data.length) {
+          const val = data[data.length - 1].value;
+          setNoMid(val);
+          onNoMid?.(val);
         }
       }
 
-      // --- B. APPLY YOUR EXACT 5-MINUTE VIEW LOGIC ---
-      // We apply this immediately after history load so the user sees data right away.
+      // Your exact initial 5m view logic
       if (!hasFittedRef.current && chartRef.current) {
         hasFittedRef.current = true;
-        
-        // Exact logic you liked:
-        chartRef.current.timeScale().setVisibleLogicalRange({
-          from: -300, 
-          to: 10,
-        } as LogicalRange);
+        chartRef.current.timeScale().setVisibleLogicalRange({ from: -300, to: 10 } as LogicalRange);
       }
-
-    } catch (e) {
-      console.error("History fetch error:", e);
-      // Continue to streaming even if history fails
+    } catch {
+      // still attempt stream
     }
 
-    // --- C. START STREAMING ---
     if (isUnmountedRef.current) return;
+
     setStatus("Connecting stream…");
 
-    const url = `/api/stream-midpoints?yes=${encodeURIComponent(
-      yesTokenId
-    )}&no=${encodeURIComponent(noTokenId)}&t=${Date.now()}`;
+    const url = `/api/stream-midpoints?yes=${encodeURIComponent(yesTokenId)}&no=${encodeURIComponent(
+      noTokenId
+    )}&t=${Date.now()}`;
 
     const es = new EventSource(url);
     eventSourceRef.current = es;
@@ -218,16 +210,15 @@ export default function PolyLiveChart({
 
     es.onmessage = (ev) => {
       try {
-        const msg = JSON.parse(ev.data);
+        const msg: any = JSON.parse(ev.data);
+        if (msg?.type === "ping") return;
 
-        // Keep-alive / Ping handling
-        if (msg.type === "ping") return; 
-
-        if (msg.type === "status") {
+        if (msg?.type === "status") {
           setStatus(String(msg.status));
           return;
         }
-        if (msg.type !== "tick") return;
+
+        if (msg?.type !== "tick") return;
 
         const tsMs = Number(msg.tsMs);
         if (!Number.isFinite(tsMs)) return;
@@ -235,40 +226,32 @@ export default function PolyLiveChart({
         const t = Math.floor(tsMs / 1000) as UTCTimestamp;
         let updated = false;
 
-        if (typeof msg.yesMid === "number") {
+        if (typeof msg.yesMid === "number" && Number.isFinite(msg.yesMid)) {
           const v = Number(msg.yesMid);
-          if (Number.isFinite(v)) {
-            yesSeriesRef.current?.update({ time: t, value: v } as LineData);
-            setYesMid(v);
-            onYesMid?.(v);
-            updated = true;
-          }
+          yesSeriesRef.current?.update({ time: t, value: v });
+          setYesMid(v);
+          onYesMid?.(v);
+          updated = true;
         }
 
-        if (typeof msg.noMid === "number") {
+        if (typeof msg.noMid === "number" && Number.isFinite(msg.noMid)) {
           const v = Number(msg.noMid);
-          if (Number.isFinite(v)) {
-            noSeriesRef.current?.update({ time: t, value: v } as LineData);
-            setNoMid(v);
-            onNoMid?.(v);
-            updated = true;
-          }
+          noSeriesRef.current?.update({ time: t, value: v });
+          setNoMid(v);
+          onNoMid?.(v);
+          updated = true;
         }
 
         if (updated) {
           setLastIso(new Date(tsMs).toISOString());
-          
-          // Re-apply view logic ONLY if not yet applied (fallback)
+
           if (!hasFittedRef.current && chartRef.current) {
             hasFittedRef.current = true;
-            chartRef.current.timeScale().setVisibleLogicalRange({
-              from: -300, 
-              to: 10,
-            } as LogicalRange);
+            chartRef.current.timeScale().setVisibleLogicalRange({ from: -300, to: 10 } as LogicalRange);
           }
         }
       } catch {
-        // ignore parse errors
+        // ignore
       }
     };
 
@@ -276,39 +259,30 @@ export default function PolyLiveChart({
       setStatus("Reconnecting...");
       es.close();
       if (!isUnmountedRef.current) {
-        // Retry connection in 3s
         reconnectTimeoutRef.current = setTimeout(connect, 3000);
       }
     };
   };
 
-  // 3. Trigger Connection on Token Change
+  // 3) Trigger on token change (and window change so drilling refreshes)
   useEffect(() => {
     isUnmountedRef.current = false;
     hasFittedRef.current = false;
-    
+
     if (yesTokenId && noTokenId) {
-       // Clear old data first
-       if (yesSeriesRef.current) yesSeriesRef.current.setData([]);
-       if (noSeriesRef.current) noSeriesRef.current.setData([]);
-       
-       connect();
+      yesSeriesRef.current?.setData([]);
+      noSeriesRef.current?.setData([]);
+      connect();
     } else {
-       setStatus("Missing token ids");
+      setStatus("Missing token ids");
     }
 
     return () => {
       isUnmountedRef.current = true;
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-        eventSourceRef.current = null;
-      }
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-      }
+      closeStream();
     };
-  }, [yesTokenId, noTokenId]); 
-  // removed onYesMid/onNoMid from dep array to avoid re-connecting on callback change
+    // windowStartTsSec included so drill changes re-run backfill and view
+  }, [yesTokenId, noTokenId, windowStartTsSec]);
 
   return (
     <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 overflow-hidden">
@@ -334,4 +308,3 @@ export default function PolyLiveChart({
     </div>
   );
 }
-
