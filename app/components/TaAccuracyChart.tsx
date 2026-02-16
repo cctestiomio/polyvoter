@@ -127,7 +127,7 @@ export default function TaAccuracyChart({ theme, marketBase, anchorStartTsSec, c
   const scored = data?.totals.scored ?? 0;
   const correct = data?.totals.correct ?? 0;
   const acc = data?.totals.accuracy;
-  const accText = acc === null || !Number.isFinite(acc) ? "-" : `${(acc * 100).toFixed(1)}%`;
+  const accText = typeof acc !== "number" || !Number.isFinite(acc) ? "-" : `${(acc * 100).toFixed(1)}%`;
 
   return (
     <div className="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-800 overflow-hidden">
@@ -150,3 +150,4 @@ export default function TaAccuracyChart({ theme, marketBase, anchorStartTsSec, c
     </div>
   );
 }
+
