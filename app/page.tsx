@@ -461,10 +461,15 @@ export default function Page() {
     const scored = marketEvents.filter(
       (e) => (e.outcome === "Yes" || e.outcome === "No") && (e.hitSide === "Yes" || e.hitSide === "No")
     );
-    
-  const hitRatePct = useMemo(() => {
-    return hitMissStats.total > 0 ? (hitMissStats.hits / hitMissStats.total) * 100 : 0;
-  }, [hitMissStats]);
+
+    const hits = scored.filter((e) => e.hitSide === e.outcome).length;
+    const misses = scored.filter((e) => e.hitSide !== e.outcome).length;
+
+    return { hits, misses, total: scored.length };
+  }, [marketEvents]);
+
+  // No hook needed here; just compute it from the memoized stats:
+  const hitRatePct = hitMissStats.total > 0 ? (hitMissStats.hits / hitMissStats.total) * 100 : 0;
 
   const hits = scored.filter((e) => e.hitSide === e.outcome).length;
   const misses = scored.filter((e) => e.hitSide !== e.outcome).length;
