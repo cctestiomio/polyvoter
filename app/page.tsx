@@ -462,14 +462,14 @@ export default function Page() {
       (e) => (e.outcome === "Yes" || e.outcome === "No") && (e.hitSide === "Yes" || e.hitSide === "No")
     );
     
-    const hitRatePct = useMemo(() => {
-      return hitMissStats.total > 0 ? (hitMissStats.hits / hitMissStats.total) * 100 : 0;
-    }, [hitMissStats]);
+  const hitRatePct = useMemo(() => {
+    return hitMissStats.total > 0 ? (hitMissStats.hits / hitMissStats.total) * 100 : 0;
+  }, [hitMissStats]);
 
-    const hits = scored.filter((e) => e.hitSide === e.outcome).length;
-    const misses = scored.filter((e) => e.hitSide !== e.outcome).length;
+  const hits = scored.filter((e) => e.hitSide === e.outcome).length;
+  const misses = scored.filter((e) => e.hitSide !== e.outcome).length;
 
-    return { hits, misses, total: scored.length };
+  return { hits, misses, total: scored.length };
   }, [marketEvents]);
 
   const btcChartKey = `btc-${tsSec}`; // refresh every slug
