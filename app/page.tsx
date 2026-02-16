@@ -455,6 +455,18 @@ export default function Page() {
     const rate = total > 0 ? (matches / total) * 100 : 0;
     return { total, matches, rate };
   }, [marketEvents]);
+  
+  const hitMissStats = useMemo(() => {
+    // only rows where outcome is resolved AND we have a hitSide (Yes/No)
+    const scored = marketEvents.filter(
+      (e) => (e.outcome === "Yes" || e.outcome === "No") && (e.hitSide === "Yes" || e.hitSide === "No")
+    );
+
+    const hits = scored.filter((e) => e.hitSide === e.outcome).length;
+    const misses = scored.filter((e) => e.hitSide !== e.outcome).length;
+
+    return { hits, misses, total: scored.length };
+  }, [marketEvents]);
 
   const btcChartKey = `btc-${tsSec}`; // refresh every slug
 
@@ -589,6 +601,18 @@ export default function Page() {
               <span className="text-sm font-normal text-zinc-500">
                 ({firstHit80Stats.matches}/{firstHit80Stats.total} resolved)
               </span>
+            </div>
+            <div className="mt-1 text-2xl font-semibold">
+              {firstHit80Stats.total === 0 ? "—" : `${firstHit80Stats.rate.toFixed(1)}%`}{" "}
+              <span className="text-sm font-normal text-zinc-500">
+                ({firstHit80Stats.matches}/{firstHit80Stats.total} resolved)
+              </span>
+            </div>
+
+            <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+              Hits: <span className="font-mono">{hitMissStats.hits}</span> | Misses:{" "}
+              <span className="font-mono">{hitMissStats.misses}</span> | Total scored:{" "}
+              <span className="font-mono">{hitMissStats.total}</span>
             </div>
           </div>
 
