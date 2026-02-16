@@ -6,9 +6,9 @@ import { useTheme } from "next-themes";
 import RtdsBtcPriceChart from "./components/RtdsBtcPriceChart";
 import PolyLiveChart from "./components/PolyLiveChart";
 import Hit80StatsChart from "./components/Hit80StatsChart";
-import TaAccuracyChart from "./components/TAAccuracyChart";
-import TaAnalysisTable, { MarketEvent } from "./components/TAAnalysisTable";
-import TaPredictionTable, { TaPredRow } from "./components/TAPredictionTable";
+import TaAccuracyChart from "./components/TaAccuracyChart";
+import TaAnalysisTable, { MarketEvent } from "./components/TaAnalysisTable";
+import TaPredictionTable, { TaPredRow } from "./components/TaPredictionTable";
 
 import type { Candle, IndicatorRow, Prediction, Signal } from "@/lib/types";
 import { computeIndicators } from "@/lib/analyze";
@@ -653,4 +653,5 @@ export default function Page() {
     </main>
   );
 }
+
 
