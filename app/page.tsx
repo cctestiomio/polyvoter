@@ -9,6 +9,7 @@ import Hit80StatsChart from "./components/Hit80StatsChart";
 import TaAccuracyChart from "./components/TaAccuracyChart";
 import TaAnalysisTable, { MarketEvent } from "./components/TaAnalysisTable";
 import TaPredictionTable, { TaPredRow } from "./components/TaPredictionTable";
+import PolyMidpointRecorder from "./components/PolyMidpointRecorder";
 
 import type { Candle, IndicatorRow, Prediction, Signal } from "@/lib/types";
 import { computeIndicators } from "@/lib/analyze";
@@ -633,6 +634,16 @@ export default function Page() {
             onNoMid={handleNoMid}
           />
         </div>
+      </div>
+      
+      <div className="px-1">
+        <PolyMidpointRecorder
+          slug={resolved?.resolvedSlug ?? null}
+          yesTokenId={yesTokenId}
+          noTokenId={noTokenId}
+          startTsSec={resolved?.startTsSec ?? null}
+          threshold={0.8}
+        />
       </div>
 
       <div className="grid gap-6 lg:grid-cols-2">

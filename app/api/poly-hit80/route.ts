@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { kv } from "@vercel/kv";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -9,7 +10,11 @@ const Q = z.object({
   anchorStartTsSec: z.coerce.number().int().positive(),
   count: z.coerce.number().int().min(1).max(240).default(70),
   threshold: z.coerce.number().min(0.5).max(0.99).default(0.8),
-  fidelity: z.coerce.number().int().min(1).max(5).default(1)
+  fidelity: z.coerce.number().int().min(1).max(5).default(1),
+
+  // Optional: if your midpoint recorder keeps recording a bit after the bucket ends,
+  // you can include it in firstHit scanning.
+  graceSec: z.coerce.number().int().min(0).max(600).default(0),
 });
 
 async function fetchJson(url: string, timeoutMs = 15000) {
@@ -88,6 +93,27 @@ function inferredWinnerFromOutcomePrices(outcomePrices: number[], closed: any): 
   return null;
 }
 
+function kvKey(slug: string, tokenId: string) {
+  return `pm:mid:${slug}:${tokenId}`;
+}
+
+async function loadMidpointsFromKv(tokenId: string, slug: string, startTsSec: number, endTsSec: number) {
+  const key = kvKey(slug, tokenId);
+  const obj = await kv.hgetall<Record<string, string>>(key);
+  if (!obj) return [];
+
+  const out: Array<{ t: number; p: number }> = [];
+  for (const [k, v] of Object.entries(obj)) {
+    const t = Number(k);
+    const p = Number(v);
+    if (!Number.isFinite(t) || !Number.isFinite(p)) continue;
+    if (t < startTsSec || t > endTsSec) continue;
+    out.push({ t, p });
+  }
+  out.sort((a, b) => a.t - b.t);
+  return out;
+}
+
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
@@ -96,18 +122,19 @@ export async function GET(req: Request) {
       anchorStartTsSec: searchParams.get("anchorStartTsSec") ?? undefined,
       count: searchParams.get("count") ?? undefined,
       threshold: searchParams.get("threshold") ?? undefined,
-      fidelity: searchParams.get("fidelity") ?? undefined
+      fidelity: searchParams.get("fidelity") ?? undefined,
+      graceSec: searchParams.get("graceSec") ?? undefined,
     });
     if (!parsed.success) return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
 
-    const { marketBase, anchorStartTsSec, count, threshold, fidelity } = parsed.data;
+    const { marketBase, anchorStartTsSec, count, threshold, fidelity, graceSec } = parsed.data;
     const base = marketBase.trim().replace(/-+$/g, "");
 
     const rows: any[] = [];
 
     for (let i = count - 1; i >= 0; i--) {
       const start = anchorStartTsSec - i * 300;
-      const end = start + 300;
+      const end = start + 300 + graceSec;
       const slug = `${base}-${start}`;
 
       try {
@@ -122,38 +149,49 @@ export async function GET(req: Request) {
         let yesHit = null;
         let noHit = null;
 
+        // Prefer per-second recorded midpoints if available (KV)
         if (yesId) {
-          const h = await fetchPricesHistory(yesId, start, end, fidelity);
-          const hist = Array.isArray(h?.history) ? h.history : [];
-          yesHit = firstHit(hist, threshold);
+          const kvHist = await loadMidpointsFromKv(yesId, slug, start, end);
+          if (kvHist.length) yesHit = firstHit(kvHist, threshold);
+          else {
+            const h = await fetchPricesHistory(yesId, start, end, fidelity);
+            const hist = Array.isArray(h?.history) ? h.history : [];
+            yesHit = firstHit(hist, threshold);
+          }
         }
+
         if (noId) {
-          const h = await fetchPricesHistory(noId, start, end, fidelity);
-          const hist = Array.isArray(h?.history) ? h.history : [];
-          noHit = firstHit(hist, threshold);
+          const kvHist = await loadMidpointsFromKv(noId, slug, start, end);
+          if (kvHist.length) noHit = firstHit(kvHist, threshold);
+          else {
+            const h = await fetchPricesHistory(noId, start, end, fidelity);
+            const hist = Array.isArray(h?.history) ? h.history : [];
+            noHit = firstHit(hist, threshold);
+          }
         }
 
         let first: null | { side: "YES" | "NO"; t: number; p: number } = null;
-        if (yesHit && noHit) first = yesHit.t <= noHit.t ? { side: "YES", t: yesHit.t, p: yesHit.p } : { side: "NO", t: noHit.t, p: noHit.p };
+        if (yesHit && noHit)
+          first =
+            yesHit.t <= noHit.t ? { side: "YES", t: yesHit.t, p: yesHit.p } : { side: "NO", t: noHit.t, p: noHit.p };
         else if (yesHit) first = { side: "YES", t: yesHit.t, p: yesHit.p };
         else if (noHit) first = { side: "NO", t: noHit.t, p: noHit.p };
 
         const outcomeKnown = resolvedWinner !== null;
-        const match =
-          first && resolvedWinner ? (first.side === resolvedWinner) : null;
+        const match = first && resolvedWinner ? first.side === resolvedWinner : null;
 
         rows.push({
           slug,
           startTsSec: start,
-          endTsSec: end,
+          endTsSec: start + 300,
           threshold,
-          firstHit: first,
+          firstHit: first, // t is epoch seconds
           resolvedWinner,
           outcomeKnown,
-          match
+          match,
         });
       } catch (e: any) {
-        rows.push({ slug, startTsSec: start, endTsSec: end, error: e?.message ?? "Failed" });
+        rows.push({ slug, startTsSec: start, endTsSec: start + 300, error: e?.message ?? "Failed" });
       }
     }
 
@@ -170,15 +208,16 @@ export async function GET(req: Request) {
         count,
         threshold,
         fidelity,
+        graceSec,
         totals: {
           hitCount: hits.length,
           knownOutcomeCount: withKnownOutcome.length,
           matchCount: matches.length,
           oppositeCount: opposites.length,
           unknownOutcomeCount: unknown.length,
-          matchRate: withKnownOutcome.length ? matches.length / withKnownOutcome.length : null
+          matchRate: withKnownOutcome.length ? matches.length / withKnownOutcome.length : null,
         },
-        rows
+        rows,
       },
       { headers: { "Cache-Control": "no-store" } }
     );
