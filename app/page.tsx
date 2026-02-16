@@ -227,7 +227,7 @@ export default function Page() {
   const [bucketMode, setBucketMode] = useState<BucketMode>("current");
   const [autoTimestamp, setAutoTimestamp] = useState(true);
   const [tsSec, setTsSec] = useState<number>(() => latest5mStartEpochSec("current"));
-  const [historySlugs, setHistorySlugs] = useState<number>(70);
+  const [historySlugs, setHistorySlugs] = useState<number>(100);
 
   const [splitTables, setSplitTables] = useState(false);
 
@@ -461,6 +461,10 @@ export default function Page() {
     const scored = marketEvents.filter(
       (e) => (e.outcome === "Yes" || e.outcome === "No") && (e.hitSide === "Yes" || e.hitSide === "No")
     );
+    
+    const hitRatePct = useMemo(() => {
+      return hitMissStats.total > 0 ? (hitMissStats.hits / hitMissStats.total) * 100 : 0;
+    }, [hitMissStats]);
 
     const hits = scored.filter((e) => e.hitSide === e.outcome).length;
     const misses = scored.filter((e) => e.hitSide !== e.outcome).length;
@@ -607,6 +611,10 @@ export default function Page() {
               Hits: <span className="font-mono">{hitMissStats.hits}</span> | Misses:{" "}
               <span className="font-mono">{hitMissStats.misses}</span> | Total scored:{" "}
               <span className="font-mono">{hitMissStats.total}</span>
+              {" "}
+              <span className="text-zinc-500">
+                ({hitMissStats.total === 0 ? "—" : `${hitMissStats.hits}/${hitMissStats.total} = ${hitRatePct.toFixed(1)}%`})
+              </span>
             </div>
           </div>
 
