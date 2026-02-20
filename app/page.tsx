@@ -30,6 +30,17 @@ type ResolveResp = {
   clobTokenIds: string[];
 };
 
+const TA_SIGNAL_WINDOW = 60;
+const TA_ACCURACY_PARAMS = {
+  window: 35,
+  minVotes: 4,
+  minConfidence: 0.35,
+  rsiUp: 56,
+  rsiDown: 44,
+  emaFast: 8,
+  emaSlow: 24,
+};
+
 function latest5mStartEpochSec(mode: BucketMode) {
   const nowSec = Math.floor(Date.now() / 1000);
   const step = 300;
@@ -404,7 +415,15 @@ export default function Page() {
           fetch(
             `/api/poly-ta-accuracy?marketBase=${encodeURIComponent(base)}&anchorStartTsSec=${encodeURIComponent(
               String(anchor)
-            )}&count=${encodeURIComponent(String(historySlugs))}&window=30&fidelity=1`,
+            )}&count=${encodeURIComponent(String(historySlugs))}` +
+              `&window=${TA_ACCURACY_PARAMS.window}` +
+              `&fidelity=1` +
+              `&minVotes=${TA_ACCURACY_PARAMS.minVotes}` +
+              `&minConfidence=${TA_ACCURACY_PARAMS.minConfidence}` +
+              `&rsiUp=${TA_ACCURACY_PARAMS.rsiUp}` +
+              `&rsiDown=${TA_ACCURACY_PARAMS.rsiDown}` +
+              `&emaFast=${TA_ACCURACY_PARAMS.emaFast}` +
+              `&emaSlow=${TA_ACCURACY_PARAMS.emaSlow}`,
             { cache: "no-store" }
           ),
         ]);
@@ -426,8 +445,7 @@ export default function Page() {
         }
 
         const taRows = parseTaRowsToTable(taJson, outcomesBySlug);
-        const TA_WINDOW = 30;
-        const taComputed = computeTaCorrectnessFromRows(taRows, TA_WINDOW);
+        const taComputed = computeTaCorrectnessFromRows(taRows, TA_SIGNAL_WINDOW);
 
         if (!alive) return;
         if (fetchId !== eventFetchIdRef.current) return;
@@ -682,7 +700,7 @@ export default function Page() {
 
       <div className="grid gap-6 lg:grid-cols-2">
         <Hit80StatsChart theme={effectiveTheme} marketBase={marketBase.trim()} anchorStartTsSec={resolved?.startTsSec ?? null} count={historySlugs} />
-        <TaAccuracyChart theme={effectiveTheme} marketBase={marketBase.trim()} anchorStartTsSec={resolved?.startTsSec ?? null} count={historySlugs} />
+        <TaAccuracyChart theme={effectiveTheme} marketBase={marketBase.trim()} anchorStartTsSec={resolved?.startTsSec ?? null} count={historySlugs} signalWindow={TA_SIGNAL_WINDOW} analysisWindow={TA_ACCURACY_PARAMS.window} strategy={TA_ACCURACY_PARAMS} />
       </div>
 
       <section className="space-y-3">
@@ -707,7 +725,7 @@ export default function Page() {
           </div>
 
           <div className="rounded-xl bg-white p-4 ring-1 ring-zinc-200 dark:bg-zinc-900/40 dark:ring-zinc-800">
-            <div className="text-sm font-medium text-zinc-800 dark:text-zinc-200">TA Correctness (Window=30)</div>
+            <div className="text-sm font-medium text-zinc-800 dark:text-zinc-200">TA Correctness (Window={TA_SIGNAL_WINDOW})</div>
             <div className="mt-1 text-2xl font-semibold">
               {taAccuracyPct.toFixed(1)}%{" "}
               <span className="text-sm font-normal text-zinc-500">({taTotalSignals} signals)</span>
